@@ -33,6 +33,7 @@ THRESHOLDS_FILE = os.path.join(DATA_DIR, "thresholds.json")
 # ── Static Config ───────────────────────────────────────────────────
 
 RECENCY_DAYS = 7
+CREATED_RECENCY_DAYS = 90  # wider window to exclude truly ancient repos
 MAX_RESULTS_PER_QUERY = 100
 MAX_PAGES = 10  # GitHub caps search results at 1000
 TRENDING_URL = "https://github.com/trending?since=daily"
@@ -269,10 +270,11 @@ def set_rate_limited():
     global _RATE_LIMITED
     _RATE_LIMITED = True
 
-def get_date_filter():
-    """Returns the `created:>YYYY-MM-DD` qualifier for the recency window."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=RECENCY_DAYS)
-    return cutoff.strftime("%Y-%m-%d")
+def get_date_filters():
+    """Return (pushed_cutoff, created_cutoff) for compound recency filter."""
+    pushed_cutoff = datetime.now(timezone.utc) - timedelta(days=RECENCY_DAYS)
+    created_cutoff = datetime.now(timezone.utc) - timedelta(days=CREATED_RECENCY_DAYS)
+    return pushed_cutoff.strftime("%Y-%m-%d"), created_cutoff.strftime("%Y-%m-%d")
 
 
 def gh_auth_token():
@@ -299,8 +301,8 @@ def github_search(query, sort="stars", order="desc", per_page=100, page=1):
     if not token:
         return [], 0
 
-    date_q = get_date_filter()
-    full_q = f"{query} created:>{date_q}"
+    pushed_q, created_q = get_date_filters()
+    full_q = f"{query} pushed:>{pushed_q} created:>{created_q}"
     params = urllib.parse.urlencode({
         "q": full_q, "sort": sort, "order": order,
         "per_page": per_page, "page": page

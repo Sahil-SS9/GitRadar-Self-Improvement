@@ -27,7 +27,7 @@ GitRadar is a two-step pipeline that discovers trending GitHub repositories, fil
 GitRadar runs in two stages:
 
 ### Stage 1: Discovery (`gitradar-discover.py`)
-1. **Collection**: Queries GitHub API for repos created in the last 7 days, supplements with trending scrape
+1. **Collection**: Queries GitHub API for repos with recent activity (pushed in last 7 days, created within 90 days), supplements with trending scrape
 2. **Filtering**: Applies rule-based noise filters (awesome lists, tutorials, dead repos, non-code)
 3. **Self-Tuning**: After each run, analyzes recent signal quality and adjusts thresholds:
    - If noise is consistently high → increases minimum star requirement
