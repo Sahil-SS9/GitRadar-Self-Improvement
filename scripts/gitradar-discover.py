@@ -444,33 +444,52 @@ def deduplicate(repos):
 
 # ── Cache ───────────────────────────────────────────────────────────
 
+CACHE_TTL_DAYS = 14  # repos expire from cache after 14 days, allowing re-discovery
+
 
 def load_cache():
-    """Load previously-seen repo names."""
+    """Load cache and prune entries older than CACHE_TTL_DAYS.
+    Supports both old format {seen: [list]} and new format {seen: {repo: date_str}}."""
     if not os.path.exists(CACHE_FILE):
         return set()
     try:
         with open(CACHE_FILE) as f:
             data = json.load(f)
-            return set(data.get("seen", []))
+        seen_data = data.get("seen", [])
+        # Old format: list of repo names (no timestamps) — clear and re-discover
+        if isinstance(seen_data, list):
+            print(f"CACHE: old list format ({len(seen_data)} entries), clearing (TTL upgrade)", file=sys.stderr)
+            return set()
+        # New format: dict of {repo: date_seen_str}
+        if isinstance(seen_data, dict):
+            now = datetime.now(timezone.utc)
+            expired = 0
+            active = set()
+            for repo, date_str in seen_data.items():
+                try:
+                    seen_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    if (now - seen_date).days < CACHE_TTL_DAYS:
+                        active.add(repo)
+                    else:
+                        expired += 1
+                except (ValueError, TypeError):
+                    expired += 1
+            if expired > 0:
+                print(f"CACHE: pruned {expired} expired entries (TTL={CACHE_TTL_DAYS}d), {len(active)} active", file=sys.stderr)
+            return active
     except (json.JSONDecodeError, KeyError):
         return set()
+    return set()
 
-
-MAX_CACHE_SIZE = 10000  # Maximum cache entries before pruning
-PRUNE_TARGET = 5000  # When we prune, keep this many
 
 def save_cache(seen):
-    """Save seen repo names, pruning if too large."""
+    """Save cache in new timestamped format: {seen: {repo: date_seen_str}}."""
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        seen_list = list(seen)
-        if len(seen_list) > MAX_CACHE_SIZE:
-            # Prune to keep the most recently added entries
-            seen_list = seen_list[-PRUNE_TARGET:]
-            print(f"CACHE: pruned to {PRUNE_TARGET} entries (was {MAX_CACHE_SIZE}+)", file=sys.stderr)
+        now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        seen_dict = {repo: now_str for repo in seen}
         with open(CACHE_FILE, "w") as f:
-            json.dump({"seen": seen_list}, f)
+            json.dump({"seen": seen_dict}, f)
     except Exception as e:
         print(f"WARN: Failed to write cache: {e}", file=sys.stderr)
 
