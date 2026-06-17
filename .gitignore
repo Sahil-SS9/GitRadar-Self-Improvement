@@ -1,5 +1,8 @@
 # User-generated data (cache, discoveries, thresholds, metrics, recommendations)
 data/
 
+# Design research notes from other projects — not part of GitRadar
+research/
+
 __pycache__/
 *.pyc
