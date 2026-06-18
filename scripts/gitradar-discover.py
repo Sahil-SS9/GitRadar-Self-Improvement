@@ -483,11 +483,44 @@ def load_cache():
 
 
 def save_cache(seen):
-    """Save cache in new timestamped format: {seen: {repo: date_seen_str}}."""
+    """Save cache preserving original first-seen timestamps.
+
+    Loads the existing cache, keeps original timestamps for repos already
+    known, and only stamps truly new entries with the current time.
+    This prevents the TTL from being reset on every run.
+    """
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        seen_dict = {repo: now_str for repo in seen}
+
+        # Load existing timestamps to preserve first-seen dates
+        old_timestamps = {}
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE) as f:
+                    old_data = json.load(f)
+                old_seen = old_data.get("seen", {})
+                if isinstance(old_seen, dict):
+                    old_timestamps = old_seen
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # Build merged dict: keep old timestamp if repo already known,
+        # otherwise stamp with current time
+        seen_dict = {}
+        new_count = 0
+        preserved_count = 0
+        for repo in seen:
+            if repo in old_timestamps:
+                seen_dict[repo] = old_timestamps[repo]
+                preserved_count += 1
+            else:
+                seen_dict[repo] = now_str
+                new_count += 1
+
+        if new_count > 0 or preserved_count > 0:
+            print(f"CACHE: {preserved_count} preserved, {new_count} new entries", file=sys.stderr)
+
         with open(CACHE_FILE, "w") as f:
             json.dump({"seen": seen_dict}, f)
     except Exception as e:
