@@ -338,14 +338,21 @@ def gh_auth_token():
         return env_token
 
     if not hasattr(gh_auth_token, "_token"):
-        result = subprocess.run(
-            ["gh", "auth", "token"], capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0:
-            print(f"WARN: gh auth failed: {result.stderr.strip()}", file=sys.stderr)
+        try:
+            result = subprocess.run(
+                ["gh", "auth", "token"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                print(f"WARN: gh auth failed: {result.stderr.strip()}", file=sys.stderr)
+                gh_auth_token._token = None
+            else:
+                gh_auth_token._token = result.stdout.strip()
+        except FileNotFoundError:
+            print("WARN: gh CLI not found and GITHUB_TOKEN not set. Running unauthenticated (60 req/hr).", file=sys.stderr)
             gh_auth_token._token = None
-        else:
-            gh_auth_token._token = result.stdout.strip()
+        except Exception as e:
+            print(f"WARN: gh auth exception: {e}", file=sys.stderr)
+            gh_auth_token._token = None
     return gh_auth_token._token
 
 
@@ -429,6 +436,58 @@ def scrape_all_trending():
                 all_results.append(r)
     print(f"TRENDING: {len(all_results)} unique repos from trending pages", file=sys.stderr)
     return all_results
+
+
+def enrich_trending_repos(trending_repos):
+    """Fetch real metadata from GitHub API for trending repos.
+    
+    Trending scraping only gets repo names, resulting in 0 stars/metadata,
+    which causes all trending repos to be filtered as 'dead_repo'.
+    This function fetches actual metadata so trending repos can be scored properly.
+    """
+    if not trending_repos:
+        return []
+    
+    enriched = []
+    for repo in trending_repos:
+        full_name = repo["full_name"]
+        url = f"https://api.github.com/repos/{full_name}"
+        
+        token = gh_auth_token()
+        if token:
+            req = urllib.request.Request(url)
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Accept", "application/vnd.github+json")
+        else:
+            req = urllib.request.Request(url)
+            req.add_header("Accept", "application/vnd.github+json")
+        
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+                # Merge scraped trending data with real API data
+                enriched_repo = {
+                    "full_name": data.get("full_name", full_name),
+                    "description": data.get("description", ""),
+                    "stars": data.get("stargazers_count", 0),
+                    "forks": data.get("forks_count", 0),
+                    "language": data.get("language", ""),
+                    "topics": data.get("topics", []),
+                    "created_at": data.get("created_at", ""),
+                    "pushed_at": data.get("pushed_at", ""),
+                    "open_issues": data.get("open_issues_count", 0),
+                    "license": (data.get("license") or {}).get("spdx_id", "") if data.get("license") else "",
+                    "html_url": data.get("html_url", f"https://github.com/{full_name}"),
+                    "source": "trending",
+                }
+                enriched.append(enriched_repo)
+        except Exception as e:
+            print(f"WARN: Failed to enrich trending repo {full_name}: {e}", file=sys.stderr)
+            # Keep original scraped data as fallback
+            enriched.append(repo)
+    
+    print(f"ENRICHED: {len(enriched)} trending repos with API metadata", file=sys.stderr)
+    return enriched
 
 
 # ── Repo Data ───────────────────────────────────────────────────────
@@ -729,6 +788,7 @@ def collect_daily(queries):
 
     # Phase 2: Trending (PRIMARY source — scrape daily AND weekly)
     trending = scrape_all_trending()
+    trending = enrich_trending_repos(trending)
     trending_new = 0
     for t in trending:
         name = t["full_name"]
@@ -808,8 +868,9 @@ def collect_weekly(queries):
                     all_repos.append(extract_repo(item))
             page += 1
 
-    # Phase 2: Trending
+    # Phase 2: Trending (weekly mode)
     trending = scrape_all_trending()
+    trending = enrich_trending_repos(trending)
     for t in trending:
         name = t["full_name"]
         if name not in seen:
