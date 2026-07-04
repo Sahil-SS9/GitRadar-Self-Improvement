@@ -21,41 +21,53 @@ class GitRadarDiscoverTests(unittest.TestCase):
     def setUp(self):
         self.discover = load_module("gitradar_discover", "scripts/gitradar-discover.py")
 
-    def test_collect_stops_after_rate_limit(self):
+    def test_collect_daily_stops_api_scan_after_rate_limit(self):
         calls = []
 
         def fake_search(query, sort="stars", order="desc", per_page=100, page=1):
             calls.append(query)
-            self.discover.set_rate_limited()
-            return [], 0
+            return [], -1
 
         queries = [
             {"q": "language:python stars:>50", "sort": "stars", "order": "desc"},
             {"q": "language:typescript stars:>50", "sort": "stars", "order": "desc"},
         ]
 
-        with mock.patch.object(self.discover, "load_cache", return_value=set()), \
-             mock.patch.object(self.discover, "save_cache"), \
-             mock.patch.object(self.discover, "scrape_trending", return_value=[]), \
+        with mock.patch.object(self.discover, "load_cache_v2", return_value=(set(), {})), \
+             mock.patch.object(self.discover, "save_cache_v2"), \
+             mock.patch.object(self.discover, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.discover, "enrich_trending_repos", return_value=[]), \
              mock.patch.object(self.discover, "github_search", side_effect=fake_search):
-            repos = self.discover.collect(queries)
+            repos, extra_stats = self.discover.collect_daily(queries)
 
         self.assertEqual(repos, [])
         self.assertEqual(calls, ["language:python stars:>50"])
+        self.assertEqual(extra_stats["new_api"], 0)
+        self.assertEqual(extra_stats["new_trending"], 0)
 
-    def test_collect_resets_stale_rate_limit_flag_at_start(self):
-        self.discover.set_rate_limited()
+    def test_collect_daily_has_no_stale_rate_limit_state_between_calls(self):
+        queries = [
+            {"q": "language:python stars:>50", "sort": "stars", "order": "desc"}
+        ]
 
-        with mock.patch.object(self.discover, "load_cache", return_value=set()), \
-             mock.patch.object(self.discover, "save_cache"), \
-             mock.patch.object(self.discover, "scrape_trending", return_value=[]), \
+        with mock.patch.object(self.discover, "load_cache_v2", return_value=(set(), {})), \
+             mock.patch.object(self.discover, "save_cache_v2"), \
+             mock.patch.object(self.discover, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.discover, "enrich_trending_repos", return_value=[]), \
+             mock.patch.object(self.discover, "github_search", return_value=([], -1)):
+            repos, _ = self.discover.collect_daily(queries)
+
+        self.assertEqual(repos, [])
+
+        with mock.patch.object(self.discover, "load_cache_v2", return_value=(set(), {})), \
+             mock.patch.object(self.discover, "save_cache_v2"), \
+             mock.patch.object(self.discover, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.discover, "enrich_trending_repos", return_value=[]), \
              mock.patch.object(self.discover, "github_search", return_value=([], 0)) as search:
-            self.discover.collect([
-                {"q": "language:python stars:>50", "sort": "stars", "order": "desc"}
-            ])
+            repos, _ = self.discover.collect_daily(queries)
 
+        self.assertEqual(repos, [])
         self.assertEqual(search.call_count, 1)
-        self.assertFalse(self.discover.is_rate_limited())
 
     def test_gh_auth_token_prefers_environment_token(self):
         with mock.patch.dict(os.environ, {"GITHUB_TOKEN": " env-token \n"}, clear=False), \
@@ -84,6 +96,42 @@ class GitRadarDiscoverTests(unittest.TestCase):
         self.assertEqual(
             self.discover.classify_noise(repo, self.discover.DEFAULT_THRESHOLDS),
             (True, "dead_repo"),
+        )
+
+    def test_enriched_trending_metadata_survives_collection(self):
+        enriched = [{
+            "full_name": "owner/useful-agent-tool",
+            "description": "Useful agent automation CLI",
+            "stars": 123,
+            "forks": 4,
+            "language": "Python",
+            "topics": ["agent-framework", "cli"],
+            "created_at": "2026-06-01T00:00:00Z",
+            "pushed_at": "2026-07-01T00:00:00Z",
+            "open_issues": 2,
+            "license": "MIT",
+            "html_url": "https://github.com/owner/useful-agent-tool",
+            "source": "trending-daily",
+        }]
+
+        with mock.patch.object(self.discover, "load_cache_v2", return_value=(set(), {})), \
+             mock.patch.object(self.discover, "save_cache_v2"), \
+             mock.patch.object(self.discover, "scrape_all_trending", return_value=[{"full_name": "owner/useful-agent-tool"}]), \
+             mock.patch.object(self.discover, "enrich_trending_repos", return_value=enriched), \
+             mock.patch.object(self.discover, "github_search", return_value=([], 0)):
+            repos, extra_stats = self.discover.collect_daily([])
+
+        self.assertEqual(len(repos), 1)
+        repo = repos[0]
+        self.assertEqual(repo["stars"], 123)
+        self.assertEqual(repo["language"], "Python")
+        self.assertEqual(repo["topics"], ["agent-framework", "cli"])
+        self.assertEqual(repo["license"], "MIT")
+        self.assertEqual(repo["source"], "trending-daily")
+        self.assertEqual(extra_stats["new_trending"], 1)
+        self.assertEqual(
+            self.discover.classify_noise(repo, self.discover.DEFAULT_THRESHOLDS),
+            (False, ""),
         )
 
     def test_spam_name_filter_catches_farmed_repos_not_legit_names(self):

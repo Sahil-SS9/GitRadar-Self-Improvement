@@ -478,7 +478,7 @@ def enrich_trending_repos(trending_repos):
                     "open_issues": data.get("open_issues_count", 0),
                     "license": (data.get("license") or {}).get("spdx_id", "") if data.get("license") else "",
                     "html_url": data.get("html_url", f"https://github.com/{full_name}"),
-                    "source": "trending",
+                    "source": repo.get("source", "trending"),
                 }
                 enriched.append(enriched_repo)
         except Exception as e:
@@ -514,6 +514,31 @@ def extract_repo(item):
         "license": item.get("license", {}).get("spdx_id", "") if item.get("license") else "",
         "html_url": item.get("html_url", ""),
         "source": "api",
+    }
+
+
+def normalise_trending_repo(item):
+    """Normalise scraped or enriched trending data without discarding metadata.
+
+    `scrape_trending` only yields a repo name and source. After enrichment, the
+    dict already has stars, language, topics, dates, and license. The collection
+    loop must preserve those fields; otherwise every enriched trending repo gets
+    downgraded back to a zero-star skeleton and is filtered as `dead_repo`.
+    """
+    full_name = item.get("full_name", "")
+    return {
+        "full_name": full_name,
+        "description": (item.get("description") or "").strip(),
+        "stars": parse_star_count(item),
+        "forks": item.get("forks", item.get("forks_count", 0)) or 0,
+        "language": item.get("language") or "",
+        "topics": item.get("topics", []) or [],
+        "created_at": item.get("created_at", ""),
+        "pushed_at": item.get("pushed_at", ""),
+        "open_issues": item.get("open_issues", item.get("open_issues_count", 0)) or 0,
+        "license": item.get("license") or "",
+        "html_url": item.get("html_url") or f"https://github.com/{full_name}",
+        "source": item.get("source", "trending"),
     }
 
 
@@ -794,20 +819,7 @@ def collect_daily(queries):
         name = t["full_name"]
         if name not in seen:
             seen.add(name)
-            all_repos.append({
-                "full_name": name,
-                "description": "",
-                "stars": 0,
-                "forks": 0,
-                "language": "",
-                "topics": [],
-                "created_at": "",
-                "pushed_at": "",
-                "open_issues": 0,
-                "license": "",
-                "html_url": f"https://github.com/{name}",
-                "source": t.get("source", "trending"),
-            })
+            all_repos.append(normalise_trending_repo(t))
             trending_new += 1
 
     # Build pushed_map from collected repos (update last_pushed in cache)
@@ -875,20 +887,7 @@ def collect_weekly(queries):
         name = t["full_name"]
         if name not in seen:
             seen.add(name)
-            all_repos.append({
-                "full_name": name,
-                "description": "",
-                "stars": 0,
-                "forks": 0,
-                "language": "",
-                "topics": [],
-                "created_at": "",
-                "pushed_at": "",
-                "open_issues": 0,
-                "license": "",
-                "html_url": f"https://github.com/{name}",
-                "source": t.get("source", "trending"),
-            })
+            all_repos.append(normalise_trending_repo(t))
 
     # Phase 3: Compare against cached pushed_at
     re_evaluated = len(active_cache)
