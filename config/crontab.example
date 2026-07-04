@@ -1,8 +1,14 @@
 # Example cron configuration for GitRadar Community Edition
 # To use with cron or systemd timers
 
-# Run discovery every day at 08:30 UTC
-30 8 * * * cd /path/to/gitradar-community && python3 scripts/github-radar-discover.py >> logs/discoveries.log 2>&1
+# Run safe discovery every day at 08:30 UTC: discover -> validate -> score
+30 8 * * * cd /path/to/gitradar-community && mkdir -p logs && python3 scripts/gitradar-safe-run.py >> logs/gitradar.log 2>&1
+
+# Weekly full re-evaluation on Mondays
+0 10 * * 1 cd /path/to/gitradar-community && mkdir -p logs && python3 scripts/gitradar-safe-run.py --mode weekly >> logs/gitradar.log 2>&1
+
+# First-run shakedown variant: fail if the run unexpectedly returns zero repos
+# 30 8 * * * cd /path/to/gitradar-community && mkdir -p logs && python3 scripts/gitradar-safe-run.py --fail-on-empty >> logs/gitradar.log 2>&1
 
 # Optional: Run weekly upstream check (if you maintain a wiki of repos)
 # 0 10 * * 1 cd /path/to/gitradar-community && python3 scripts/upstream-monitor.py >> logs/upstream.log 2>&1

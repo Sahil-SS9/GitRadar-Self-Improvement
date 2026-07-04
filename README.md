@@ -82,30 +82,37 @@ gh auth login
 # Or provide a token directly
 export GITHUB_TOKEN=<your-token>
 
-# Run daily discovery (new finds, dedup'd against cache)
-python3 scripts/gitradar-discover.py
+# Run daily discovery safely: discover → validate → score
+python3 scripts/gitradar-safe-run.py
 
-# Run weekly re-evaluation (full cache scan with pushed_at tracking)
-python3 scripts/gitradar-discover.py --mode weekly
+# Run weekly re-evaluation safely: discover → validate → score
+python3 scripts/gitradar-safe-run.py --mode weekly
 
 # Or use the convenience wrapper
 bash scripts/gitradar-weekly.sh
 
 # View results
 cat data/discoveries.json
+cat data/recommendations.json
 ```
 
 ### Scheduled Usage
 
-Set up two cron jobs for best coverage:
+Set up two cron jobs for best coverage. Use the safe wrapper in scheduled runs;
+it fails loudly if `discoveries.json` is malformed, internally inconsistent, or
+shows the known trending-metadata skeleton regression.
 
 ```cron
 # Daily new-find scan
-30 4 * * * cd /path/to/GitRadar && python3 scripts/gitradar-discover.py
+30 4 * * * cd /path/to/GitRadar && mkdir -p logs && python3 scripts/gitradar-safe-run.py >> logs/gitradar.log 2>&1
 
 # Weekly full re-evaluation (Mondays)
-0 6 * * 1 cd /path/to/GitRadar && bash scripts/gitradar-weekly.sh
+0 6 * * 1 cd /path/to/GitRadar && mkdir -p logs && python3 scripts/gitradar-safe-run.py --mode weekly >> logs/gitradar.log 2>&1
 ```
+
+For first-run shakedowns, add `--fail-on-empty` or `--min-repos N` to make an
+unexpectedly empty collection fail instead of only warning. For mature daily runs,
+zero new repos can be legitimate when the cache absorbs duplicates.
 
 ## Configuration
 
@@ -210,15 +217,39 @@ Note: `stats` always present. `extra_stats` shape depends on mode:
 }
 ```
 
+### Cron-safe validation
+
+`scripts/gitradar-validate.py` checks `data/discoveries.json` before downstream
+agents consume it:
+
+```bash
+python3 scripts/gitradar-validate.py --input data/discoveries.json
+```
+
+It validates:
+
+- required top-level fields and mode-specific `extra_stats`
+- stats consistency (`after_filter + noise == total_collected`, `len(repos) == after_dedup`)
+- required repo fields and numeric types
+- duplicate repos
+- enriched trending repos collapsing back to zero-star skeletons
+
+The safe runner combines discovery, validation, and scoring:
+
+```bash
+python3 scripts/gitradar-safe-run.py --mode daily
+python3 scripts/gitradar-safe-run.py --mode weekly --fail-on-empty
+```
+
 ## Integration with AI Agent Systems
 
 GitRadar works with any AI agent framework that can consume JSON and execute cron jobs:
 
 ### Hermes Agent / Other Frameworks
 
-1. Copy `scripts/gitradar-discover.py` to your scripts directory
-2. Configure a cron job running daily (`--mode daily`) + weekly (`--mode weekly`)
-3. Consume `data/discoveries.json` — use the `classification` and `score` fields to prioritise
+1. Copy `scripts/gitradar-discover.py`, `scripts/gitradar-validate.py`, `scripts/gitradar-score.py`, and `scripts/gitradar-safe-run.py` to your scripts directory
+2. Configure a cron job running the safe wrapper daily (`--mode daily`) + weekly (`--mode weekly`)
+3. Consume `data/discoveries.json` and/or `data/recommendations.json` only after validation succeeds
 
 The `mode` field in the output tells you whether it was a daily or weekly run, so downstream processors can interpret `extra_stats` accordingly.
 

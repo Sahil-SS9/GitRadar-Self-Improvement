@@ -160,6 +160,123 @@ class GitRadarDiscoverTests(unittest.TestCase):
             self.assertNotEqual(reason, "spam_name", legit)
 
 
+class GitRadarValidateTests(unittest.TestCase):
+    def setUp(self):
+        self.validate = load_module("gitradar_validate", "scripts/gitradar-validate.py")
+
+    def valid_payload(self):
+        return {
+            "collected_at": "2026-07-03T00:00:00Z",
+            "mode": "daily",
+            "stats": {
+                "total_collected": 1,
+                "after_filter": 1,
+                "after_dedup": 1,
+                "noise": 0,
+                "noise_rate_pct": 0.0,
+                "signal_rate_pct": 100.0,
+                "active_threshold": 75,
+                "collection_queries": 13,
+            },
+            "extra_stats": {
+                "total": 1,
+                "new_api": 0,
+                "new_trending": 1,
+                "cached_active": 0,
+            },
+            "repos": [{
+                "full_name": "owner/useful-agent-tool",
+                "description": "Useful agent automation CLI",
+                "stars": 123,
+                "forks": 4,
+                "language": "Python",
+                "topics": ["agent-framework", "cli"],
+                "created_at": "2026-06-01T00:00:00Z",
+                "pushed_at": "2026-07-01T00:00:00Z",
+                "open_issues": 2,
+                "license": "MIT",
+                "html_url": "https://github.com/owner/useful-agent-tool",
+                "source": "trending-daily",
+                "score": 75.4,
+            }],
+        }
+
+    def test_validate_accepts_good_payload(self):
+        errors, warnings = self.validate.validate_discoveries(self.valid_payload())
+        self.assertEqual(errors, [])
+        self.assertEqual(warnings, [])
+
+    def test_validate_rejects_missing_schema_fields(self):
+        payload = self.valid_payload()
+        del payload["stats"]["after_dedup"]
+        del payload["repos"][0]["html_url"]
+
+        errors, _ = self.validate.validate_discoveries(payload)
+
+        self.assertTrue(any("missing stats keys: after_dedup" in e for e in errors))
+        self.assertTrue(any("missing fields: html_url" in e for e in errors))
+
+    def test_validate_rejects_empty_output_when_required(self):
+        payload = self.valid_payload()
+        payload["stats"].update({
+            "total_collected": 0,
+            "after_filter": 0,
+            "after_dedup": 0,
+            "noise": 0,
+            "noise_rate_pct": 0.0,
+            "signal_rate_pct": 0.0,
+        })
+        payload["extra_stats"].update({"total": 0, "new_trending": 0})
+        payload["repos"] = []
+
+        errors, warnings = self.validate.validate_discoveries(payload, fail_on_empty=True)
+
+        self.assertTrue(any("empty collection" in e for e in errors))
+        self.assertEqual(warnings, [])
+
+    def test_validate_warns_on_empty_output_when_not_required(self):
+        payload = self.valid_payload()
+        payload["stats"].update({
+            "total_collected": 0,
+            "after_filter": 0,
+            "after_dedup": 0,
+            "noise": 0,
+            "noise_rate_pct": 0.0,
+            "signal_rate_pct": 0.0,
+        })
+        payload["extra_stats"].update({"total": 0, "new_trending": 0})
+        payload["repos"] = []
+
+        errors, warnings = self.validate.validate_discoveries(payload)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(any("zero repos" in w for w in warnings))
+
+    def test_validate_rejects_trending_skeleton_regression(self):
+        payload = self.valid_payload()
+        payload["repos"][0].update({
+            "description": "",
+            "stars": 0,
+            "language": "",
+            "topics": [],
+            "pushed_at": "",
+            "license": "",
+            "source": "trending-daily",
+        })
+
+        errors, _ = self.validate.validate_discoveries(payload)
+
+        self.assertTrue(any("trending metadata collapsed to skeleton" in e for e in errors))
+
+    def test_validate_rejects_stats_mismatch(self):
+        payload = self.valid_payload()
+        payload["stats"]["after_dedup"] = 2
+
+        errors, _ = self.validate.validate_discoveries(payload)
+
+        self.assertTrue(any("len(repos) must equal after_dedup" in e for e in errors))
+
+
 class GitRadarScoreTests(unittest.TestCase):
     def setUp(self):
         self.score = load_module("gitradar_score", "scripts/gitradar-score.py")
