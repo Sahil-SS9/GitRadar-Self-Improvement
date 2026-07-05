@@ -1,11 +1,14 @@
 # Example cron configuration for GitRadar Community Edition
 # To use with cron or systemd timers
 
-# Run safe discovery every day at 08:30 UTC: discover -> validate -> score
+# Run safe discovery every day at 08:30 UTC: discover -> validate -> top 100 recommendations >= 70
 30 8 * * * cd /path/to/gitradar-community && mkdir -p logs && python3 scripts/gitradar-safe-run.py >> logs/gitradar.log 2>&1
 
-# Weekly full re-evaluation on Mondays
+# Weekly full re-evaluation on Mondays, with the same recommendation cap
 0 10 * * 1 cd /path/to/gitradar-community && mkdir -p logs && python3 scripts/gitradar-safe-run.py --mode weekly >> logs/gitradar.log 2>&1
+
+# Example stricter output shaping: only top 50 recommendations scoring >= 80
+# 0 10 * * 1 cd /path/to/gitradar-community && mkdir -p logs && python3 scripts/gitradar-safe-run.py --mode weekly --recommendation-limit 50 --min-score 80 >> logs/gitradar.log 2>&1
 
 # First-run shakedown variant: fail if the run unexpectedly returns zero repos
 # 30 8 * * * cd /path/to/gitradar-community && mkdir -p logs && python3 scripts/gitradar-safe-run.py --fail-on-empty >> logs/gitradar.log 2>&1

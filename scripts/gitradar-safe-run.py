@@ -3,9 +3,10 @@
 Cron-safe GitRadar runner.
 
 Runs discovery, validates the generated discoveries.json, and optionally runs the
-scoring/classification step. Use this wrapper from cron/systemd instead of
-calling gitradar-discover.py directly: a suspicious JSON output should fail loud
-before downstream agents trust it.
+scoring/classification step with a bounded ranked recommendation output. Use this
+wrapper from cron/systemd instead of calling gitradar-discover.py directly: a
+suspicious JSON output should fail loud before downstream agents trust it, and
+scheduled jobs should not dump thousands of weakly-ranked candidates by default.
 """
 
 import argparse
@@ -34,6 +35,10 @@ def main() -> int:
     parser.add_argument("--python", default=sys.executable, help="Python executable to use for child scripts")
     parser.add_argument("--min-repos", type=int, default=0, help="Fail validation if fewer than this many repos survive")
     parser.add_argument("--fail-on-empty", action="store_true", help="Fail validation if discovery collects zero repos")
+    parser.add_argument("--recommendation-limit", type=int, default=100,
+                        help="Maximum scored recommendations to write after ranking (0 = unlimited)")
+    parser.add_argument("--min-score", type=float, default=70.0,
+                        help="Drop scored recommendations below this score threshold")
     parser.add_argument("--skip-score", action="store_true", help="Only discover+validate; do not run gitradar-score.py")
     args = parser.parse_args()
 
@@ -54,7 +59,18 @@ def main() -> int:
         return result.returncode
 
     if not args.skip_score:
-        score_cmd = [args.python, SCORE, "--input", DISCOVERIES, "--output", RECOMMENDATIONS]
+        score_cmd = [
+            args.python,
+            SCORE,
+            "--input",
+            DISCOVERIES,
+            "--output",
+            RECOMMENDATIONS,
+            "--limit",
+            str(args.recommendation_limit),
+            "--min-score",
+            str(args.min_score),
+        ]
         result = run_step(score_cmd, "score")
         if result.returncode != 0:
             print(f"FAIL: scoring exited {result.returncode}", file=sys.stderr)

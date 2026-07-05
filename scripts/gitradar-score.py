@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
 GitRadar Scoring and Classification Script
-Reads discoveries.json from the discovery step, scores each repo,
-classifies into labels (ADOPT, EXTRACT, FORK/PRODUCT, PLUGIN/SKILL, INSPIRATION, NOISE),
-and outputs recommendations.json.
+Reads discoveries.json from the discovery step, scores each repo, filters/sorts
+ranked candidates, classifies into labels (ADOPT, EXTRACT, FORK/PRODUCT,
+PLUGIN/SKILL, INSPIRATION, NOISE), and outputs recommendations.json.
 
 Usage:
-    python3 scripts/gitradar-score.py [--input DISCOVERIES_JSON] [--output RECOMMENDATIONS_JSON]
+    python3 scripts/gitradar-score.py [--input DISCOVERIES_JSON] [--output RECOMMENDATIONS_JSON] [--limit N] [--min-score N]
 
 Defaults:
     --input: data/discoveries.json
     --output: data/recommendations.json
+    --limit: 0 (unlimited)
+    --min-score: 0.0
 """
 
 import json
@@ -238,12 +240,48 @@ def classify_repo(score):
     else:
         return "NOISE"
 
+
+def score_repositories(repos, stack, min_score=0.0, limit=0):
+    """Score, filter, sort, and optionally cap repositories.
+
+    A 0 limit means unlimited. Sorting happens after score computation so the
+    output is a ranked recommendation list rather than discovery-order JSON.
+    """
+    scored_repos = []
+    for repo in repos:
+        score = compute_score(repo, stack)
+        if score < min_score:
+            continue
+        label = classify_repo(score)
+        repo_with_score = dict(repo)  # Shallow copy
+        repo_with_score["score"] = round(score, 2)
+        repo_with_score["label"] = label
+        scored_repos.append(repo_with_score)
+
+    scored_repos.sort(
+        key=lambda repo: (
+            float(repo.get("score") or 0),
+            int(repo.get("stars") or 0),
+            str(repo.get("pushed_at") or ""),
+            str(repo.get("full_name") or ""),
+        ),
+        reverse=True,
+    )
+    if limit and limit > 0:
+        return scored_repos[:limit]
+    return scored_repos
+
+
 def main():
     parser = argparse.ArgumentParser(description="Score and classify GitRadar discoveries.")
     parser.add_argument("--input", default=os.path.join(DATA_DIR, "discoveries.json"),
                         help="Input discoveries JSON file (default: data/discoveries.json)")
     parser.add_argument("--output", default=os.path.join(DATA_DIR, "recommendations.json"),
                         help="Output recommendations JSON file (default: data/recommendations.json)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Maximum recommendations to write after ranking (0 = unlimited)")
+    parser.add_argument("--min-score", type=float, default=0.0,
+                        help="Drop repos with computed score below this threshold")
     args = parser.parse_args()
 
     # Load stack preferences
@@ -255,21 +293,20 @@ def main():
         sys.exit(1)
 
     repos = discoveries.get("repos", [])
-    scored_repos = []
-
-    for repo in repos:
-        score = compute_score(repo, stack)
-        label = classify_repo(score)
-        # Add score and label to the repo object
-        repo_with_score = dict(repo)  # Shallow copy
-        repo_with_score["score"] = round(score, 2)
-        repo_with_score["label"] = label
-        scored_repos.append(repo_with_score)
+    scored_repos = score_repositories(
+        repos,
+        stack,
+        min_score=args.min_score,
+        limit=args.limit,
+    )
 
     # Build output
     output = {
         "collected_at": discoveries.get("collected_at"),
+        "source_total_repos": len(repos),
         "total_repos": len(scored_repos),
+        "min_score": args.min_score,
+        "limit": args.limit,
         "repos": scored_repos
     }
 
@@ -284,7 +321,11 @@ def main():
         label = repo["label"]
         label_counts[label] = label_counts.get(label, 0) + 1
 
-    print(f"SCORED: {len(scored_repos)} repos", file=sys.stderr)
+    print(
+        f"SCORED: {len(scored_repos)} recommendations "
+        f"from {len(repos)} repos (min_score={args.min_score}, limit={args.limit or 'unlimited'})",
+        file=sys.stderr,
+    )
     for label, count in sorted(label_counts.items()):
         print(f"  {label}: {count}", file=sys.stderr)
 

@@ -308,6 +308,30 @@ class GitRadarScoreTests(unittest.TestCase):
             35.0,
         )
 
+    def test_score_repositories_filters_sorts_and_limits_ranked_output(self):
+        repos = [
+            {"full_name": "owner/low", "stars": 999, "pushed_at": "2026-07-05T00:00:00Z"},
+            {"full_name": "owner/high-fewer-stars", "stars": 5, "pushed_at": "2026-07-05T00:00:00Z"},
+            {"full_name": "owner/high-more-stars", "stars": 50, "pushed_at": "2026-07-05T00:00:00Z"},
+            {"full_name": "owner/mid", "stars": 1000, "pushed_at": "2026-07-05T00:00:00Z"},
+        ]
+        scores = {
+            "owner/low": 10.0,
+            "owner/high-fewer-stars": 90.0,
+            "owner/high-more-stars": 90.0,
+            "owner/mid": 70.0,
+        }
+
+        with mock.patch.object(self.score, "compute_score", side_effect=lambda repo, stack: scores[repo["full_name"]]):
+            ranked = self.score.score_repositories(repos, self.stack, min_score=60.0, limit=2)
+
+        self.assertEqual([repo["full_name"] for repo in ranked], [
+            "owner/high-more-stars",
+            "owner/high-fewer-stars",
+        ])
+        self.assertEqual([repo["score"] for repo in ranked], [90.0, 90.0])
+        self.assertEqual([repo["label"] for repo in ranked], ["ADOPT", "ADOPT"])
+
 
 if __name__ == "__main__":
     unittest.main()

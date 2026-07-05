@@ -82,11 +82,16 @@ gh auth login
 # Or provide a token directly
 export GITHUB_TOKEN=<your-token>
 
-# Run daily discovery safely: discover → validate → score
+# Run daily discovery safely: discover → validate → ranked recommendations
+# Safe-run defaults to top 100 recommendations with score >= 70.
 python3 scripts/gitradar-safe-run.py
 
-# Run weekly re-evaluation safely: discover → validate → score
+# Run weekly re-evaluation safely with the same recommendation cap
 python3 scripts/gitradar-safe-run.py --mode weekly
+
+# Override recommendation shaping when needed
+python3 scripts/gitradar-safe-run.py --mode weekly --recommendation-limit 50 --min-score 80
+python3 scripts/gitradar-score.py --input data/discoveries.json --output data/recommendations.json --limit 100 --min-score 70
 
 # Or use the convenience wrapper
 bash scripts/gitradar-weekly.sh
@@ -100,7 +105,9 @@ cat data/recommendations.json
 
 Set up two cron jobs for best coverage. Use the safe wrapper in scheduled runs;
 it fails loudly if `discoveries.json` is malformed, internally inconsistent, or
-shows the known trending-metadata skeleton regression.
+shows the known trending-metadata skeleton regression. By default, safe-run writes
+ranked recommendations capped to the top 100 repos with computed score >= 70,
+while `data/discoveries.json` preserves the full validated candidate set.
 
 ```cron
 # Daily new-find scan
@@ -192,10 +199,13 @@ Default threshold: 75 (self-tunes between 25-500).
 ```
 
 Note: `stats` always present. `extra_stats` shape depends on mode:
-- **Daily**: `{total, new_api, new_trending, refreshed}`
+- **Daily**: `{total, new_api, new_trending, cached_active}`
 - **Weekly**: `{re_evaluated, with_new_activity, new_finds, total_in_scope}`
 
 ### Per-repo entry
+
+`data/discoveries.json` contains the full validated candidate set. `data/recommendations.json`
+contains scored candidates after optional `--min-score` filtering and `--limit` capping:
 
 ```json
 {
@@ -212,8 +222,7 @@ Note: `stats` always present. `extra_stats` shape depends on mode:
   "html_url": "https://github.com/owner/repo-name",
   "source": "api",
   "score": 68.3,
-  "classification": "EXTRACT",
-  "why": "On-mission repo: worth extracting concepts or patterns."
+  "label": "EXTRACT"
 }
 ```
 
@@ -234,11 +243,20 @@ It validates:
 - duplicate repos
 - enriched trending repos collapsing back to zero-star skeletons
 
-The safe runner combines discovery, validation, and scoring:
+The safe runner combines discovery, validation, and ranked recommendation output:
 
 ```bash
 python3 scripts/gitradar-safe-run.py --mode daily
 python3 scripts/gitradar-safe-run.py --mode weekly --fail-on-empty
+```
+
+Safe-run defaults to `--recommendation-limit 100 --min-score 70` so scheduled
+jobs emit a usable short list instead of thousands of scored candidates. Direct
+scoring keeps an unlimited default for ad-hoc analysis, but supports the same
+shaping explicitly:
+
+```bash
+python3 scripts/gitradar-score.py --limit 100 --min-score 70
 ```
 
 ## Integration with AI Agent Systems
