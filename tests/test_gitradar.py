@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -273,14 +275,47 @@ class GitRadarImportIsolationTests(unittest.TestCase):
         self.assertEqual(sys.argv, before)
 
     def test_load_module_restores_argv_when_import_raises(self):
+        """argv must be restored when the imported module's body itself fails.
+
+        A valid spec/loader is used so control genuinely reaches
+        ``exec_module``. Failure is injected *inside* the module body, after
+        the controlled argv has been installed, which is the only way to
+        exercise ``_ArgvGuard.__exit__`` on the exception path. Returning
+        ``None`` from ``spec_from_file_location`` (the previous version of
+        this test) raises before the guard is entered, so it proved nothing.
+        """
         before = list(sys.argv)
-        with mock.patch.object(importlib.util, "spec_from_file_location", return_value=None):
-            with self.assertRaises(ImportError):
-                load_module(
-                    "does_not_matter",
-                    "scripts/gitradar-discover.py",
-                    argv=["probe", "--mode", "weekly"],
-                )
+        controlled = ["probe", "--mode", "weekly"]
+        observed = {}
+
+        spec = importlib.util.spec_from_file_location(
+            "gitradar_discover_raising", ROOT / "scripts/gitradar-discover.py"
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        loader = spec.loader
+        real_exec = loader.exec_module
+
+        def exec_then_fail(module):
+            # Body runs under the controlled argv; capture what it saw.
+            real_exec(module)
+            observed["argv_during_body"] = list(sys.argv)
+            observed["mode_during_body"] = getattr(module, "MODE", None)
+            raise RuntimeError("injected failure inside exec_module")
+
+        with mock.patch.object(loader, "exec_module", side_effect=exec_then_fail):
+            with mock.patch.object(importlib.util, "spec_from_file_location", return_value=spec):
+                with self.assertRaises(RuntimeError):
+                    load_module(
+                        "gitradar_discover_raising",
+                        "scripts/gitradar-discover.py",
+                        argv=controlled,
+                    )
+
+        # The failure was reached, and it happened under the controlled argv.
+        self.assertEqual(observed.get("argv_during_body"), controlled)
+        self.assertEqual(observed.get("mode_during_body"), "weekly")
+        # And the caller's argv survived that failure.
         self.assertEqual(sys.argv, before)
 
 
