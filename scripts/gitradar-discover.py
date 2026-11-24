@@ -19,6 +19,7 @@ Weekly mode (`--mode weekly`):
 v4.1.0 — Dual-mode, pushed_at tracking, trending as primary source.
 """
 
+import copy
 import hashlib
 import json
 import math
@@ -344,9 +345,10 @@ def tune_and_publish(noise_rate_pct, signal_rate_pct, acquisition_outcome=None):
     """
     with StateLock():
         current = load_thresholds()
-        # self_tune mutates the dict it is handed, so snapshot the committed
-        # values before deciding.
-        committed_before = dict(current)
+        # self_tune mutates the dict it is handed, including the NESTED
+        # history list, so a shallow copy would still share it and a failed
+        # commit would report a history event that never reached disk.
+        committed_before = copy.deepcopy(current)
         updated, actions = self_tune(
             current, noise_rate_pct, signal_rate_pct, acquisition_outcome
         )

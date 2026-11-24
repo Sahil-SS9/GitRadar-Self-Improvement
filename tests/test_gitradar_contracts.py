@@ -279,6 +279,31 @@ class R3CommitHonesty(unittest.TestCase):
         on_disk = json.loads(pathlib.Path(self.d.THRESHOLDS_FILE).read_text())
         self.assertEqual(on_disk["star_threshold"], 125)
 
+    def test_failed_commit_rolls_back_nested_history(self):
+        """R3: the whole committed state returns, not just the scalar."""
+        self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=125, history=[
+            {"tuned_at": "2026-11-01T00:00:00Z", "star_threshold": 125, "actions": ["HOLD"]},
+        ]))
+        before = json.loads(pathlib.Path(self.d.THRESHOLDS_FILE).read_text())
+        prior = [{"noise_rate_pct": 5.0, "signal_rate_pct": 95.0}] * 4
+        real = self.d.atomic_write_json
+
+        def explode(path, data, indent=2):
+            if path == self.d.THRESHOLDS_FILE:
+                raise OSError("injected thresholds write failure")
+            return real(path, data, indent=indent)
+
+        with mock.patch.object(self.d, "load_metrics", return_value=list(prior)), \
+             mock.patch.object(self.d, "atomic_write_json", side_effect=explode):
+            updated, actions, committed = self.d.tune_and_publish(5.0, 95.0, self.d.ACQ_OK)
+
+        self.assertFalse(committed)
+        self.assertEqual(updated["star_threshold"], 125)
+        self.assertEqual(updated["history"], before["history"],
+                         f"uncommitted history leaked: {updated['history']}")
+        self.assertEqual(json.loads(pathlib.Path(self.d.THRESHOLDS_FILE).read_text()), before)
+        self.assertTrue(any("COMMIT FAILED" in a for a in actions), actions)
+
     def test_successful_commit_matches_disk(self):
         self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=125))
         prior = [{"noise_rate_pct": 5.0, "signal_rate_pct": 95.0}] * 4
