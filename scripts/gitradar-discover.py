@@ -167,27 +167,77 @@ def new_generation_id(mode=None, when=None):
     return f"{when.strftime('%Y%m%dT%H%M%S%fZ')}-{mode or MODE}-{uuid.uuid4().hex[:8]}"
 
 
+COMMIT_REQUIRED_FIELDS = (
+    "generation", "mode", "date", "status",
+    "discoveries_file", "discoveries_sha256",
+    "manifest_file", "manifest_sha256",
+)
+
+
+def _read_bytes(path):
+    """Read a file once and close it. Callers hash and parse the same buffer."""
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def read_committed_discoveries(path=None):
     """Return (payload, commit) for a committed generation, else None.
 
-    Fails closed: no commit pointer, a malformed one, a mismatched digest or
-    a non-complete status all mean "not a committed result".
+    Fails closed. Required binding metadata is not optional: a pointer that
+    omits a checksum is invalid, not "unverified but acceptable". Every
+    artefact the commit promises is checked — the discoveries bytes and the
+    manifest bytes — and the generation must agree across all three.
     """
-    path = path or OUTPUT_FILE
+    path = pathlib_path = path or OUTPUT_FILE
     try:
-        with open(COMMIT_FILE, encoding="utf-8") as f:
-            commit = json.load(f)
-    except (OSError, ValueError):
+        commit = json.loads(_read_bytes(COMMIT_FILE).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
         return None
-    if not isinstance(commit, dict) or commit.get("status") != "complete":
+    if not isinstance(commit, dict):
+        return None
+    for field in COMMIT_REQUIRED_FIELDS:
+        if not commit.get(field):
+            return None
+    if commit["status"] != "complete" or commit["mode"] not in ("daily", "weekly"):
+        return None
+    if os.path.basename(pathlib_path) != os.path.basename(commit["discoveries_file"]):
+        return None
+
+    # Discoveries: hash and parse the SAME bytes.
+    try:
+        raw = _read_bytes(pathlib_path)
+    except OSError:
+        return None
+    if hashlib.sha256(raw).hexdigest() != commit["discoveries_sha256"]:
         return None
     try:
-        payload = json.loads(open(path, encoding="utf-8").read())
-    except (OSError, ValueError):
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
         return None
-    actual = hashlib.sha256(open(path, "rb").read()).hexdigest()
-    if commit.get("discoveries_sha256") and actual != commit["discoveries_sha256"]:
+
+    # Manifest: present, byte-identical, and describing this generation.
+    # Resolve against the configured manifest path first so an isolated or
+    # relocated data root stays self-consistent.
+    manifest_path = (MANIFEST_FILE
+                     if os.path.basename(MANIFEST_FILE) == commit["manifest_file"]
+                     else os.path.join(DATA_DIR, commit["manifest_file"]))
+    try:
+        mraw = _read_bytes(manifest_path)
+    except OSError:
         return None
+    if hashlib.sha256(mraw).hexdigest() != commit["manifest_sha256"]:
+        return None
+    try:
+        manifest = json.loads(mraw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if manifest.get("generation") != commit["generation"]:
+        return None
+    if manifest.get("mode") != commit["mode"]:
+        return None
+    if manifest.get("discoveries_sha256") != commit["discoveries_sha256"]:
+        return None
+
     return payload, commit
 
 

@@ -205,6 +205,53 @@ class R3Transactions(unittest.TestCase):
                          "an unchecked repo was stamped as freshly checked")
 
 
+    def _committed_run(self):
+        with mock.patch.object(self.d, "gh_auth_token", return_value="tok"), \
+             mock.patch.object(self.d, "wait_for_rate_limit"), \
+             mock.patch.object(self.d, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.d, "enrich_trending_repos", side_effect=lambda r: list(r)), \
+             mock.patch.object(self.d, "github_search", return_value=([], 0)), \
+             mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()), \
+             mock.patch("sys.stderr", new_callable=lambda: __import__("io").StringIO()):
+            self.d.main()
+        return pathlib.Path(self.d.COMMIT_FILE)
+
+    def test_required_bindings_cannot_be_omitted(self):
+        """A pointer that drops a checksum is invalid, not merely unverified."""
+        commit_path = self._committed_run()
+        for field in ("discoveries_sha256", "manifest_sha256",
+                      "discoveries_file", "generation", "mode"):
+            commit = json.loads(commit_path.read_text())
+            commit.pop(field)
+            commit_path.write_text(json.dumps(commit), encoding="utf-8")
+            self.assertIsNone(self.d.read_committed_discoveries(),
+                              f"a pointer without {field} was accepted")
+
+    def test_changed_manifest_is_rejected(self):
+        self._committed_run()
+        manifest = pathlib.Path(self.d.MANIFEST_FILE)
+        data = json.loads(manifest.read_text())
+        data["repos_listed"] = 99
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(self.d.read_committed_discoveries(),
+                          "a tampered manifest was accepted")
+
+    def test_changed_generation_in_manifest_is_rejected(self):
+        self._committed_run()
+        manifest = pathlib.Path(self.d.MANIFEST_FILE)
+        data = json.loads(manifest.read_text())
+        data["generation"] = "some-other-run"
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        # Re-bind the digest so only the generation disagrees.
+        commit_path = pathlib.Path(self.d.COMMIT_FILE)
+        import hashlib
+        commit = json.loads(commit_path.read_text())
+        commit["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        commit_path.write_text(json.dumps(commit), encoding="utf-8")
+        self.assertIsNone(self.d.read_committed_discoveries(),
+                          "a generation mismatch was accepted")
+
+
 class R3CommitHonesty(unittest.TestCase):
     """R3: a failed threshold commit must not be reported as success."""
 
