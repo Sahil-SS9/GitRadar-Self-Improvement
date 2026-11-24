@@ -227,6 +227,50 @@ class R3Transactions(unittest.TestCase):
             self.assertIsNone(self.d.read_committed_discoveries(),
                               f"a pointer without {field} was accepted")
 
+    def test_wrong_typed_bindings_are_refused_not_raised(self):
+        """Malformed metadata is an uncommitted result, never a TypeError.
+
+        A filename field holding a list reaches os.path.basename; the reader
+        must validate container shapes before consuming them.
+        """
+        commit_path = self._committed_run()
+        genuine = json.loads(commit_path.read_text())
+
+        cases = {
+            "discoveries_file": [genuine["discoveries_file"]],
+            "manifest_file": [genuine["manifest_file"]],
+            "generation": ["gen"],
+            "mode": ["daily"],
+            "date": ["2026-11-24"],
+            "status": 1,
+            "discoveries_sha256": {"a": 1},
+            "repos_listed": [1],
+        }
+        for field, value in cases.items():
+            bad = dict(genuine)
+            bad[field] = value
+            commit_path.write_text(json.dumps(bad), encoding="utf-8")
+            try:
+                result = self.d.read_committed_discoveries()
+            except Exception as exc:  # noqa: BLE001 - this is the assertion
+                self.fail(f"{field} as {type(value).__name__} raised {type(exc).__name__}: {exc}")
+            self.assertIsNone(result, f"{field} as {type(value).__name__} was accepted")
+
+        # Restoring the genuine marker restores successful selection.
+        commit_path.write_text(json.dumps(genuine), encoding="utf-8")
+        self.assertIsNotNone(self.d.read_committed_discoveries())
+
+    def test_unsafe_filenames_are_refused(self):
+        """A binding must name a file in the configured root, not a path."""
+        commit_path = self._committed_run()
+        genuine = json.loads(commit_path.read_text())
+        for unsafe in ("../../etc/passwd", "/etc/passwd", ".", "..", ""):
+            bad = dict(genuine)
+            bad["discoveries_file"] = unsafe
+            commit_path.write_text(json.dumps(bad), encoding="utf-8")
+            self.assertIsNone(self.d.read_committed_discoveries(),
+                              f"unsafe filename accepted: {unsafe!r}")
+
     def test_changed_manifest_is_rejected(self):
         self._committed_run()
         manifest = pathlib.Path(self.d.MANIFEST_FILE)

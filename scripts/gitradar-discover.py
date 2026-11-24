@@ -181,6 +181,75 @@ def _read_bytes(path):
         return f.read()
 
 
+def _is_binding_text(value):
+    """A binding field must be a non-empty, safe filename/identifier string.
+
+    Metadata is parsed from JSON on disk, so its types are attacker- or
+    corruption-controlled. Callers must not hand a list or dict to
+    os.path.basename, path joins or int().
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if "\x00" in value:
+        return False
+    # Safe filename: no directory components, no traversal.
+    if os.path.sep in value or (os.path.altsep and os.path.altsep in value):
+        return False
+    return value not in (".", "..")
+
+
+def _is_count(value, *, allow_none=True):
+    """Counts must be real non-negative integers, never bools or strings."""
+    if value is None:
+        return allow_none
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _commit_schema_ok(commit):
+    """Validate the commit container before any field is consumed."""
+    if not isinstance(commit, dict):
+        return False
+    for field in COMMIT_REQUIRED_FIELDS:
+        if field == "status":
+            if commit.get(field) not in ("complete", "partial"):
+                return False
+            continue
+        if field == "mode":
+            if commit.get(field) not in ("daily", "weekly"):
+                return False
+            continue
+        if field == "date":
+            if not isinstance(commit.get(field), str) or not commit.get(field).strip():
+                return False
+            continue
+        if field in ("discoveries_file", "manifest_file"):
+            if not _is_binding_text(commit.get(field)):
+                return False
+            continue
+        if not isinstance(commit.get(field), str) or not commit.get(field).strip():
+            return False
+    # Optional counts, when present, must be sane.
+    for optional in ("repos_listed", "repos_found"):
+        if optional in commit and not _is_count(commit.get(optional)):
+            return False
+    return True
+
+
+def _manifest_schema_ok(manifest, commit):
+    if not isinstance(manifest, dict):
+        return False
+    if manifest.get("generation") != commit["generation"]:
+        return False
+    if manifest.get("mode") != commit["mode"]:
+        return False
+    if manifest.get("discoveries_sha256") != commit["discoveries_sha256"]:
+        return False
+    for optional in ("repos_listed", "repos_found"):
+        if optional in manifest and not _is_count(manifest.get(optional)):
+            return False
+    return True
+
+
 def read_committed_discoveries(path=None):
     """Return (payload, commit) for a committed generation, else None.
 
@@ -194,14 +263,12 @@ def read_committed_discoveries(path=None):
         commit = json.loads(_read_bytes(COMMIT_FILE).decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return None
-    if not isinstance(commit, dict):
+    # Reject malformed metadata as "uncommitted", never as an exception.
+    if not _commit_schema_ok(commit):
         return None
-    for field in COMMIT_REQUIRED_FIELDS:
-        if not commit.get(field):
-            return None
-    if commit["status"] != "complete" or commit["mode"] not in ("daily", "weekly"):
+    if commit["status"] != "complete":
         return None
-    if os.path.basename(pathlib_path) != os.path.basename(commit["discoveries_file"]):
+    if os.path.basename(pathlib_path) != commit["discoveries_file"]:
         return None
 
     # Discoveries: hash and parse the SAME bytes.
@@ -232,11 +299,7 @@ def read_committed_discoveries(path=None):
         manifest = json.loads(mraw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return None
-    if manifest.get("generation") != commit["generation"]:
-        return None
-    if manifest.get("mode") != commit["mode"]:
-        return None
-    if manifest.get("discoveries_sha256") != commit["discoveries_sha256"]:
+    if not _manifest_schema_ok(manifest, commit):
         return None
 
     return payload, commit
