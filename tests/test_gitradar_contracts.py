@@ -175,8 +175,8 @@ class R3Transactions(unittest.TestCase):
         self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=100))
         prior = [{"noise_rate_pct": 5.0, "signal_rate_pct": 95.0}] * 4
         with mock.patch.object(self.d, "load_metrics", return_value=list(prior)):
-            a, acts_a = self.d.tune_and_publish(5.0, 95.0, self.d.ACQ_OK)
-            b, acts_b = self.d.tune_and_publish(5.0, 95.0, self.d.ACQ_OK)
+            a, acts_a, _ = self.d.tune_and_publish(5.0, 95.0, self.d.ACQ_OK)
+            b, acts_b, _ = self.d.tune_and_publish(5.0, 95.0, self.d.ACQ_OK)
         written = json.loads(pathlib.Path(self.d.THRESHOLDS_FILE).read_text())
         self.assertEqual(len(written.get("history", [])), 2, "a history event was lost")
         self.assertEqual(written["star_threshold"], b["star_threshold"])
@@ -205,6 +205,43 @@ class R3Transactions(unittest.TestCase):
                          "an unchecked repo was stamped as freshly checked")
 
 
+class R3CommitHonesty(unittest.TestCase):
+    """R3: a failed threshold commit must not be reported as success."""
+
+    def setUp(self):
+        self.d = load_module("r3_commit", "scripts/gitradar-discover.py")
+
+    def test_failed_commit_returns_committed_values(self):
+        self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=125))
+        prior = [{"noise_rate_pct": 5.0, "signal_rate_pct": 95.0}] * 4
+        real = self.d.atomic_write_json
+
+        def explode(path, data, indent=2):
+            if path == self.d.THRESHOLDS_FILE:
+                raise OSError("injected thresholds write failure")
+            return real(path, data, indent=indent)
+
+        with mock.patch.object(self.d, "load_metrics", return_value=list(prior)), \
+             mock.patch.object(self.d, "atomic_write_json", side_effect=explode):
+            updated, actions, committed = self.d.tune_and_publish(5.0, 95.0, self.d.ACQ_OK)
+
+        self.assertFalse(committed, "a failed commit was reported as success")
+        self.assertEqual(updated["star_threshold"], 125,
+                         "returned a threshold that never landed")
+        self.assertTrue(any("COMMIT FAILED" in a for a in actions), actions)
+        on_disk = json.loads(pathlib.Path(self.d.THRESHOLDS_FILE).read_text())
+        self.assertEqual(on_disk["star_threshold"], 125)
+
+    def test_successful_commit_matches_disk(self):
+        self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=125))
+        prior = [{"noise_rate_pct": 5.0, "signal_rate_pct": 95.0}] * 4
+        with mock.patch.object(self.d, "load_metrics", return_value=list(prior)):
+            updated, actions, committed = self.d.tune_and_publish(5.0, 95.0, self.d.ACQ_OK)
+        self.assertTrue(committed)
+        on_disk = json.loads(pathlib.Path(self.d.THRESHOLDS_FILE).read_text())
+        self.assertEqual(on_disk["star_threshold"], updated["star_threshold"])
+
+
 class R4Acquisition(unittest.TestCase):
     """R4: a late success cannot erase an earlier failure."""
 
@@ -224,7 +261,7 @@ class R4Acquisition(unittest.TestCase):
         self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=75))
         prior = [{"noise_rate_pct": 0.0, "signal_rate_pct": 0.0}] * 5
         with mock.patch.object(self.d, "load_metrics", return_value=list(prior)):
-            updated, actions = self.d.tune_and_publish(0.0, 0.0, self.d.ACQ_TIMEOUT)
+            updated, actions, committed = self.d.tune_and_publish(0.0, 0.0, self.d.ACQ_TIMEOUT)
         self.assertEqual(updated["star_threshold"], 75)
         self.assertTrue(actions[0].startswith("SKIP"), actions)
 
@@ -232,7 +269,7 @@ class R4Acquisition(unittest.TestCase):
         self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=75))
         prior = [{"noise_rate_pct": 0.0, "signal_rate_pct": 0.0}] * 5
         with mock.patch.object(self.d, "load_metrics", return_value=list(prior)):
-            updated, actions = self.d.tune_and_publish(0.0, 0.0, self.d.ACQ_OK)
+            updated, actions, committed = self.d.tune_and_publish(0.0, 0.0, self.d.ACQ_OK)
         self.assertEqual(updated["star_threshold"], 125, actions)
 
 

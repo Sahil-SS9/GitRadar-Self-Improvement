@@ -275,11 +275,12 @@ def load_thresholds():
 
 
 def save_thresholds(thresholds):
-    """Persist thresholds to disk."""
-    try:
-        atomic_write_json(THRESHOLDS_FILE, thresholds)
-    except (OSError, ValueError, TypeError) as e:
-        print(f"WARN: Failed to write thresholds: {e}", file=sys.stderr)
+    """Persist thresholds to disk, raising if the commit did not happen.
+
+    Swallowing the failure let a caller announce a threshold that was never
+    written.
+    """
+    atomic_write_json(THRESHOLDS_FILE, thresholds)
 
 
 def tune_and_publish(noise_rate_pct, signal_rate_pct, acquisition_outcome=None):
@@ -293,11 +294,26 @@ def tune_and_publish(noise_rate_pct, signal_rate_pct, acquisition_outcome=None):
     """
     with StateLock():
         current = load_thresholds()
+        # self_tune mutates the dict it is handed, so snapshot the committed
+        # values before deciding.
+        committed_before = dict(current)
         updated, actions = self_tune(
             current, noise_rate_pct, signal_rate_pct, acquisition_outcome
         )
-        save_thresholds(updated)
-        return updated, actions
+        try:
+            save_thresholds(updated)
+        except Exception as e:
+            return committed_before, list(actions) + [
+                f"COMMIT FAILED: thresholds not written ({e}); "
+                f"star_threshold remains {committed_before['star_threshold']}"
+            ], False
+        on_disk = load_thresholds()
+        if on_disk.get("star_threshold") != updated.get("star_threshold"):
+            return dict(on_disk), list(actions) + [
+                f"COMMIT FAILED: read-back found star_threshold "
+                f"{on_disk.get('star_threshold')}, not {updated.get('star_threshold')}"
+            ], False
+        return updated, actions, True
 
 
 def build_queries(thresholds):
@@ -1659,7 +1675,7 @@ def main():
     # Stage 3: Self-tuning from aggregated acquisition status only, as one
     # transaction so a concurrent writer cannot overwrite the decision.
     acquisition = acquisition_status()
-    thresholds, tuning_actions = tune_and_publish(
+    thresholds, tuning_actions, tuning_committed = tune_and_publish(
         noise_rate_pct, signal_rate_pct, acquisition["worst"]
     )
 
@@ -1678,6 +1694,7 @@ def main():
         "active_threshold": thresholds["star_threshold"],
         "collection_queries": len(queries),
         "tuning_actions": tuning_actions,
+        "tuning_committed": tuning_committed,
         "filter_reasons": {k: len(v) for k, v in filter_reasons.items()},
     }
 
