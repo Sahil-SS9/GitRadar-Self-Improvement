@@ -273,6 +273,46 @@ class R4Acquisition(unittest.TestCase):
         self.assertEqual(updated["star_threshold"], 125, actions)
 
 
+class R4PersistedHistory(unittest.TestCase):
+    """R4: failed runs must not leak through stored history."""
+
+    def setUp(self):
+        self.d = load_module("r4_history", "scripts/gitradar-discover.py")
+
+    def test_ineligible_rows_are_excluded_from_the_window(self):
+        self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=75))
+        genuine = [{"noise_rate_pct": 5.0, "signal_rate_pct": 95.0,
+                    "observation_eligible": True}] * 4
+        failed = [{"noise_rate_pct": 100.0, "signal_rate_pct": 0.0,
+                   "observation_eligible": False, "status": "partial"}]
+        with mock.patch.object(self.d, "load_metrics", return_value=list(failed + genuine)):
+            updated, actions, committed = self.d.tune_and_publish(5.0, 95.0, self.d.ACQ_OK)
+        self.assertFalse(any(a.startswith("RAISE") for a in actions), actions)
+
+    def test_legacy_rows_without_marker_stay_eligible(self):
+        self.d.save_thresholds(dict(self.d.DEFAULT_THRESHOLDS, star_threshold=75))
+        legacy = [{"noise_rate_pct": 0.0, "signal_rate_pct": 0.0}] * 5
+        with mock.patch.object(self.d, "load_metrics", return_value=list(legacy)):
+            updated, actions, _ = self.d.tune_and_publish(0.0, 0.0, self.d.ACQ_OK)
+        self.assertEqual(updated["star_threshold"], 125,
+                         "legacy history was wrongly excluded")
+
+    def test_reset_happens_on_every_main_invocation(self):
+        """A previous in-process failure must not poison the next run."""
+        self.d.record_acquisition(self.d.ACQ_TIMEOUT, "earlier run")
+        self.assertTrue(self.d.acquisition_status()["partial"])
+        with mock.patch.object(self.d, "gh_auth_token", return_value="tok"), \
+             mock.patch.object(self.d, "wait_for_rate_limit"), \
+             mock.patch.object(self.d, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.d, "enrich_trending_repos", side_effect=lambda r: list(r)), \
+             mock.patch.object(self.d, "github_search", return_value=([], 0)), \
+             mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()), \
+             mock.patch("sys.stderr", new_callable=lambda: __import__("io").StringIO()):
+            self.d.main()
+        self.assertEqual(self.d.acquisition_status()["worst"], self.d.ACQ_OK,
+                         "acquisition state was not reset at the start of main")
+
+
 class R5Coverage(unittest.TestCase):
     """R5: weekly history, honest coverage and the bounded recheck."""
 

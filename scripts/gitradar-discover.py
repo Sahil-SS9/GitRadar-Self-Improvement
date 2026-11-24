@@ -420,10 +420,19 @@ def self_tune(thresholds, noise_rate_pct, signal_rate_pct, acquisition_outcome=N
     actions = []
     metrics = load_metrics()
 
-    # Build analysis window: last N entries + today
-    recent = metrics[-METRICS_LOOKBACK_DAYS:] if len(metrics) >= METRICS_LOOKBACK_DAYS else metrics
-    today = {"noise_rate_pct": noise_rate_pct, "signal_rate_pct": signal_rate_pct}
-    window = list(recent) + [today] if recent else [today]
+    # Only genuine observations may inform the controller. Rows explicitly
+    # marked ineligible (failed/partial acquisition) are skipped so a bad run
+    # cannot shift a later decision. Legacy rows predate the marker and are
+    # treated as eligible — documented, and never rewritten.
+    eligible = [m for m in metrics if m.get("observation_eligible", True) is not False]
+    recent = eligible[-METRICS_LOOKBACK_DAYS:] if len(eligible) >= METRICS_LOOKBACK_DAYS else eligible
+    today = {
+        "noise_rate_pct": noise_rate_pct,
+        "signal_rate_pct": signal_rate_pct,
+        "observation_eligible": acquisition_outcome in (None, ACQ_OK),
+        "acquisition_outcome": acquisition_outcome,
+    }
+    window = list(recent) + [today]
 
     if len(window) < 2:
         return thresholds, ["Not enough data to tune (need 2+ runs)"]
@@ -1640,6 +1649,9 @@ def build_text_summary(repos, stats, extra_stats):
 
 def main():
     """Full pipeline: collect → filter → dedup → score → tune → output."""
+    # Every run starts a fresh acquisition record, so a previous in-process
+    # failure cannot poison this run's status or tuning eligibility.
+    reset_acquisition()
     # Load thresholds
     thresholds = load_thresholds()
     queries = build_queries(thresholds)
@@ -1784,6 +1796,12 @@ def main():
         "signal_rate_pct": signal_rate_pct,
         "noise_rate_pct": noise_rate_pct,
         "star_threshold": thresholds["star_threshold"],
+        # Provenance: a failed/partial run is history, not evidence.
+        "observation_eligible": acquisition["worst"] == ACQ_OK and not acquisition["partial"],
+        "acquisition_outcome": acquisition["worst"],
+        "acquisition_counts": acquisition["counts"],
+        "partial": acquisition["partial"],
+        "status": "partial" if acquisition["partial"] else "complete",
     }
     if MODE == "weekly" and extra_stats:
         metrics_entry["re_evaluated"] = extra_stats.get("re_evaluated", 0)
