@@ -195,13 +195,35 @@ class GitRadarDiscoverTests(unittest.TestCase):
         self.assertEqual(token, "env-token")
         run.assert_not_called()
 
-    # NOTE (Phase 1A ledger): this test characterises current behaviour in
-    # which a Trending-only record — which carries no API metadata — is
-    # classified as `dead_repo` and therefore discarded. That discard is a
-    # known defect, not intended behaviour; the assertion is retained here
-    # only so the eventual Phase 1C repair has a witnessed before-state.
-    # Do not treat a green result here as endorsement of the behaviour.
-    def test_trending_skeleton_is_filtered_as_dead_repo_by_default(self):
+    # NOTE (Phase 1C): this previously asserted that a Trending-only record
+    # — which carries no API metadata — is classified `dead_repo` and thrown
+    # away. That discard WAS the defect: it made the primary source
+    # contribute zero rows. The corrected contract is that missing metadata
+    # is unknown, not empty, while a measured zero still counts as dead.
+    def test_trending_skeleton_is_not_a_dead_repo_when_metadata_is_unknown(self):
+        skeleton = {
+            "full_name": "owner/repo",
+            "description": "",
+            "stars": None,
+            "forks": None,
+            "language": "",
+            "topics": [],
+            "created_at": "",
+            "pushed_at": "",
+            "open_issues": None,
+            "license": "",
+            "html_url": "https://github.com/owner/repo",
+            "source": "trending",
+            "metadata_status": "unknown",
+        }
+
+        self.assertFalse(self.discover.metadata_is_known(skeleton))
+        self.assertEqual(
+            self.discover.classify_noise(skeleton, self.discover.DEFAULT_THRESHOLDS),
+            (False, ""),
+        )
+
+    def test_measured_zero_stars_is_still_a_dead_repo(self):
         repo = {
             "full_name": "owner/repo",
             "description": "",
@@ -214,7 +236,8 @@ class GitRadarDiscoverTests(unittest.TestCase):
             "open_issues": 0,
             "license": "",
             "html_url": "https://github.com/owner/repo",
-            "source": "trending",
+            "source": "api",
+            "metadata_status": "complete",
         }
 
         self.assertEqual(
@@ -317,6 +340,55 @@ class GitRadarImportIsolationTests(unittest.TestCase):
         self.assertEqual(observed.get("mode_during_body"), "weekly")
         # And the caller's argv survived that failure.
         self.assertEqual(sys.argv, before)
+
+
+class GitRadarTrendingMetadataTests(unittest.TestCase):
+    """A Trending row must survive the real collector and filter path."""
+
+    def setUp(self):
+        self.discover = load_module("gitradar_discover_trending", "scripts/gitradar-discover.py")
+
+    def _collect(self, method, scraped):
+        with mock.patch.object(self.discover, "load_cache_v2", return_value=(set(), {})), \
+             mock.patch.object(self.discover, "save_cache_v2"), \
+             mock.patch.object(self.discover, "scrape_all_trending", return_value=list(scraped)), \
+             mock.patch.object(self.discover, "enrich_trending_repos",
+                               side_effect=lambda rows: list(rows)), \
+             mock.patch.object(self.discover, "github_search", return_value=([], 0)):
+            return getattr(self.discover, method)([
+                {"q": "language:python stars:>25", "sort": "stars", "order": "desc"}
+            ])
+
+    def test_enriched_metadata_reaches_the_collected_row(self):
+        scraped = [{
+            "full_name": "acme/rich", "stars": 480, "description": "a real description",
+            "forks": 54, "language": "TypeScript", "topics": ["llm"],
+            "created_at": "2026-09-12T00:00:00Z", "pushed_at": "2026-11-20T00:00:00Z",
+            "open_issues": 4, "license": "MIT", "html_url": "https://github.com/acme/rich",
+            "source": "trending",
+        }]
+        repos, _ = self._collect("collect_daily", scraped)
+        row = next(r for r in repos if r["full_name"] == "acme/rich")
+
+        self.assertEqual(row["stars"], 480, "enriched stars were discarded")
+        self.assertEqual(row["description"], "a real description")
+        self.assertEqual(row["language"], "TypeScript")
+        self.assertEqual(row["topics"], ["llm"])
+
+    def test_unenriched_row_survives_filtering(self):
+        """An unavailable-metadata row must not be deleted as a dead repo."""
+        scraped = [{
+            "full_name": "acme/unknown", "stars": None, "description": "",
+            "source": "trending", "metadata_status": "unavailable",
+        }]
+        repos, _ = self._collect("collect_daily", scraped)
+
+        row = next((r for r in repos if r["full_name"] == "acme/unknown"), None)
+        self.assertIsNotNone(row, "Trending row dropped during collection")
+
+        kept, reasons = self.discover.filter_repos(repos, self.discover.DEFAULT_THRESHOLDS)
+        self.assertIn("acme/unknown", [r["full_name"] for r in kept],
+                      f"Trending row filtered out: {reasons}")
 
 
 class GitRadarScoreTests(unittest.TestCase):

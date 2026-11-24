@@ -537,7 +537,10 @@ def build_noise_patterns(thresholds):
             r["full_name"].lower().startswith(prefix)
             for prefix in ["learn-", "awesome-", "tutorial-"]
         ),
-        "dead_repo": lambda r: (
+        # Only a measured star count can prove a repo is dead. Rows whose
+        # metadata could not be fetched are unknown, not empty: filtering
+        # them here was what deleted every Trending repo.
+        "dead_repo": lambda r: metadata_is_known(r) and (
             parse_star_count(r) < dead_min
             or (r.get("forks", 0) or 0) > parse_star_count(r) * fork_ratio
         ),
@@ -551,6 +554,16 @@ def build_noise_patterns(thresholds):
             for p in spam_patterns
         ),
     }
+
+
+METADATA_UNKNOWN_STATES = ("unknown", "unavailable", "deferred")
+
+
+def metadata_is_known(repo):
+    """True only when the star count is a real measurement, not a placeholder."""
+    if repo.get("metadata_status") in METADATA_UNKNOWN_STATES:
+        return False
+    return repo.get("stars") is not None
 
 
 NOISE_ORDER = ["awesome_list", "non_code", "name_noise", "spam_name", "tutorial_content", "dead_repo"]
@@ -794,19 +807,24 @@ def collect_daily(queries):
         name = t["full_name"]
         if name not in seen:
             seen.add(name)
+            # Keep what enrichment actually returned. Rebuilding the row
+            # with stars=0 threw the fetched metadata away and made every
+            # Trending repo a dead_repo, so this "primary source" contributed
+            # nothing at all.
             all_repos.append({
                 "full_name": name,
-                "description": "",
-                "stars": 0,
-                "forks": 0,
-                "language": "",
-                "topics": [],
-                "created_at": "",
-                "pushed_at": "",
-                "open_issues": 0,
-                "license": "",
-                "html_url": f"https://github.com/{name}",
+                "description": t.get("description", ""),
+                "stars": t.get("stars"),
+                "forks": t.get("forks"),
+                "language": t.get("language", ""),
+                "topics": list(t.get("topics") or []),
+                "created_at": t.get("created_at", ""),
+                "pushed_at": t.get("pushed_at", ""),
+                "open_issues": t.get("open_issues"),
+                "license": t.get("license", ""),
+                "html_url": t.get("html_url") or f"https://github.com/{name}",
                 "source": t.get("source", "trending"),
+                "metadata_status": t.get("metadata_status", "complete"),
             })
             trending_new += 1
 
@@ -875,19 +893,24 @@ def collect_weekly(queries):
         name = t["full_name"]
         if name not in seen:
             seen.add(name)
+            # Keep what enrichment actually returned. Rebuilding the row
+            # with stars=0 threw the fetched metadata away and made every
+            # Trending repo a dead_repo, so this "primary source" contributed
+            # nothing at all.
             all_repos.append({
                 "full_name": name,
-                "description": "",
-                "stars": 0,
-                "forks": 0,
-                "language": "",
-                "topics": [],
-                "created_at": "",
-                "pushed_at": "",
-                "open_issues": 0,
-                "license": "",
-                "html_url": f"https://github.com/{name}",
+                "description": t.get("description", ""),
+                "stars": t.get("stars"),
+                "forks": t.get("forks"),
+                "language": t.get("language", ""),
+                "topics": list(t.get("topics") or []),
+                "created_at": t.get("created_at", ""),
+                "pushed_at": t.get("pushed_at", ""),
+                "open_issues": t.get("open_issues"),
+                "license": t.get("license", ""),
+                "html_url": t.get("html_url") or f"https://github.com/{name}",
                 "source": t.get("source", "trending"),
+                "metadata_status": t.get("metadata_status", "complete"),
             })
 
     # Phase 3: Compare against cached pushed_at
