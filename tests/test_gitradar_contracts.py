@@ -106,15 +106,14 @@ class R2CompleteGeneration(unittest.TestCase):
         self.assertEqual(out.read_text(encoding="utf-8"), '{"previous": "good run"}',
                          "a failed run overwrote the last good output")
 
-        manifest = json.loads(
-            (pathlib.Path(self.d.DATA_DIR) / "discoveries-manifest.json").read_text()
-        )
-        self.assertEqual(manifest["status"], "partial")
-        self.assertFalse(manifest["tuning_eligible"])
-        self.assertTrue(
-            (pathlib.Path(self.d.DATA_DIR) / "discoveries-daily-partial.json").exists(),
-            "the partial artefact was not written for diagnosis",
-        )
+        # A failed attempt writes diagnostics beside the committed generation
+        # and leaves the commit pointer untouched.
+        self.assertTrue(pathlib.Path(self.d.ATTEMPT_FILE).exists(),
+                        "the attempt record was not written")
+        attempt = json.loads(pathlib.Path(self.d.ATTEMPT_FILE).read_text())
+        self.assertEqual(attempt["status"], "partial")
+        self.assertFalse(pathlib.Path(self.d.COMMIT_FILE).exists(),
+                         "a failed first publication must not commit")
         self.assertIn("kept as last-good", stderr)
 
     def test_complete_run_publishes(self):
@@ -131,11 +130,39 @@ class R2CompleteGeneration(unittest.TestCase):
             self.d.main()
         published = json.loads(out.read_text(encoding="utf-8"))
         self.assertIn("repos", published)
-        manifest = json.loads(
-            (pathlib.Path(self.d.DATA_DIR) / "discoveries-manifest.json").read_text()
-        )
+        manifest = json.loads(pathlib.Path(self.d.MANIFEST_FILE).read_text())
         self.assertEqual(manifest["status"], "complete")
         self.assertTrue(manifest["tuning_eligible"])
+        commit = json.loads(pathlib.Path(self.d.COMMIT_FILE).read_text())
+        self.assertEqual(commit["generation"], manifest["generation"])
+
+
+    def test_reader_rejects_a_tampered_generation(self):
+        """The committed result is bound to bytes, not just to a filename."""
+        with mock.patch.object(self.d, "gh_auth_token", return_value="tok"), \
+             mock.patch.object(self.d, "wait_for_rate_limit"), \
+             mock.patch.object(self.d, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.d, "enrich_trending_repos", side_effect=lambda r: list(r)), \
+             mock.patch.object(self.d, "github_search", return_value=([], 0)), \
+             mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()), \
+             mock.patch("sys.stderr", new_callable=lambda: __import__("io").StringIO()):
+            self.d.main()
+
+        committed = self.d.read_committed_discoveries()
+        self.assertIsNotNone(committed, "a clean run did not commit")
+        payload, commit = committed
+        self.assertEqual(commit["status"], "complete")
+
+        # Same block count, different bytes: must not be accepted.
+        pathlib.Path(self.d.OUTPUT_FILE).write_text('{"repos": [], "tampered": true}')
+        self.assertIsNone(self.d.read_committed_discoveries(),
+                          "tampered bytes were accepted as the committed generation")
+
+    def test_reader_fails_closed_without_a_commit_marker(self):
+        pathlib.Path(self.d.OUTPUT_FILE).write_text('{"repos": []}')
+        if pathlib.Path(self.d.COMMIT_FILE).exists():
+            pathlib.Path(self.d.COMMIT_FILE).unlink()
+        self.assertIsNone(self.d.read_committed_discoveries())
 
 
 class R3Transactions(unittest.TestCase):

@@ -32,6 +32,9 @@ STATE_PATH_NAMES = (
     # module pointing at the real checkout.
     "RECHECK_QUEUE_FILE",
     "OUTCOMES_FILE",
+    "COMMIT_FILE",
+    "MANIFEST_FILE",
+    "ATTEMPT_FILE",
 )
 
 

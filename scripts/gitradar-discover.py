@@ -19,6 +19,7 @@ Weekly mode (`--mode weekly`):
 v4.1.0 — Dual-mode, pushed_at tracking, trending as primary source.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 import time
 import fcntl
 import urllib.error
@@ -145,6 +147,48 @@ def atomic_write_json(path, data, indent=2):
     text = json.dumps(data, indent=indent, default=str)
     json.loads(text)
     return atomic_write_text(path, text)
+
+
+# ── Committed generation ────────────────────────────────────────────
+#
+# A published discoveries.json is only trustworthy if it can be tied to the
+# exact bytes and manifest that were committed together. The commit pointer
+# is written last; a reader that finds no valid pointer must treat the file
+# as uncommitted rather than assume it is current.
+
+COMMIT_FILE = os.path.join(DATA_DIR, "discoveries-commit.json")
+MANIFEST_FILE = os.path.join(DATA_DIR, "discoveries-manifest.json")
+ATTEMPT_FILE = os.path.join(DATA_DIR, "discoveries-attempt.json")
+
+
+def new_generation_id(mode=None, when=None):
+    """Unique-per-run identity. Content is bound separately by digest."""
+    when = when or datetime.now(timezone.utc)
+    return f"{when.strftime('%Y%m%dT%H%M%S%fZ')}-{mode or MODE}-{uuid.uuid4().hex[:8]}"
+
+
+def read_committed_discoveries(path=None):
+    """Return (payload, commit) for a committed generation, else None.
+
+    Fails closed: no commit pointer, a malformed one, a mismatched digest or
+    a non-complete status all mean "not a committed result".
+    """
+    path = path or OUTPUT_FILE
+    try:
+        with open(COMMIT_FILE, encoding="utf-8") as f:
+            commit = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(commit, dict) or commit.get("status") != "complete":
+        return None
+    try:
+        payload = json.loads(open(path, encoding="utf-8").read())
+    except (OSError, ValueError):
+        return None
+    actual = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    if commit.get("discoveries_sha256") and actual != commit["discoveries_sha256"]:
+        return None
+    return payload, commit
 
 
 # ── Static Config ───────────────────────────────────────────────────
@@ -1659,26 +1703,54 @@ def main():
     # snapshot with an ordinary-looking empty result. A partial run is written
     # beside it for diagnosis and the published file is left alone.
     os.makedirs(DATA_DIR, exist_ok=True)
-    manifest = {
-        "schema": 3,
-        "mode": MODE,
-        "date": DATE_STR,
-        "run_id": f"{DATE_STR}-{MODE}-{TIME_STR}",
-        "collected_at": output["collected_at"],
-        "status": "partial" if acquisition["partial"] else "complete",
-        "acquisition_outcome": acquisition["worst"],
-        "acquisition_counts": acquisition["counts"],
-        "partial": acquisition["partial"],
-        "tuning_eligible": acquisition["worst"] == ACQ_OK,
-        "repos_found": len(scored),
-        "repos_listed": len([r for r in scored if r.get("classification") != "NOISE"]),
-    }
+    generation = new_generation_id()
+    listed = len([r for r in scored if r.get("classification") != "NOISE"])
     if acquisition["partial"]:
-        atomic_write_json(os.path.join(DATA_DIR, f"discoveries-{MODE}-partial.json"), output)
-        print(f"PUBLISH: partial run — {OUTPUT_FILE} kept as last-good", file=sys.stderr)
+        # A failed attempt must not displace the committed generation.
+        atomic_write_json(ATTEMPT_FILE, {
+            "generation": generation, "mode": MODE, "date": DATE_STR,
+            "status": "partial", "acquisition_outcome": acquisition["worst"],
+            "acquisition_counts": acquisition["counts"],
+            "repos_found": len(scored), "repos_listed": listed,
+        })
+        print(f"PUBLISH: partial attempt — {OUTPUT_FILE} kept as last-good", file=sys.stderr)
     else:
         atomic_write_json(OUTPUT_FILE, output)
-    atomic_write_json(os.path.join(DATA_DIR, "discoveries-manifest.json"), manifest)
+        json_sha = hashlib.sha256(
+            json.dumps(output, indent=2, default=str).encode("utf-8")).hexdigest()
+        manifest = {
+            "schema": 3,
+            "generation": generation,
+            "mode": MODE,
+            "date": DATE_STR,
+            "run_id": generation,
+            "collected_at": output["collected_at"],
+            "status": "complete",
+            "acquisition_outcome": acquisition["worst"],
+            "acquisition_counts": acquisition["counts"],
+            "partial": False,
+            "tuning_eligible": acquisition["worst"] == ACQ_OK,
+            "repos_found": len(scored),
+            "repos_listed": listed,
+            "discoveries_sha256": json_sha,
+        }
+        atomic_write_json(MANIFEST_FILE, manifest)
+        manifest_sha = hashlib.sha256(
+            json.dumps(manifest, indent=2, default=str).encode("utf-8")).hexdigest()
+        atomic_write_json(COMMIT_FILE, {
+            "schema": 1,
+            "generation": generation,
+            "mode": MODE,
+            "date": DATE_STR,
+            "status": "complete",
+            "discoveries_file": os.path.basename(OUTPUT_FILE),
+            "discoveries_sha256": hashlib.sha256(
+                open(OUTPUT_FILE, "rb").read()).hexdigest(),
+            "manifest_file": os.path.basename(MANIFEST_FILE),
+            "manifest_sha256": manifest_sha,
+            "repos_found": len(scored),
+            "repos_listed": listed,
+        })
 
     # Print clean human-readable summary to stdout
     print(build_text_summary(scored, stats, extra_stats))
