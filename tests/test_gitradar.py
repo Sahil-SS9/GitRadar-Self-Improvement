@@ -28,6 +28,10 @@ STATE_PATH_NAMES = (
     "OUTPUT_FILE",
     "METRICS_FILE",
     "THRESHOLDS_FILE",
+    # Added with the recheck/outcome contracts; omitting them leaves the
+    # module pointing at the real checkout.
+    "RECHECK_QUEUE_FILE",
+    "OUTCOMES_FILE",
 )
 
 

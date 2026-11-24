@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import fcntl
 import urllib.error
@@ -75,31 +76,47 @@ TIME_STR = datetime.now(timezone.utc).strftime("%H:%M")
 _STATE_LOCK_NAME = ".state.lock"
 
 
+_LOCK_STATE = threading.local()
+
+
 class StateLock:
-    """Exclusive advisory lock around a shared read-modify-write cycle.
+    """Reentrant exclusive advisory lock for a shared read-modify-write cycle.
 
     Atomic replacement stops torn files. It does not stop two writers each
     loading, modifying and saving, where the second silently discards the
     first's update.
+
+    Reentrant within a thread: flock() is per open-file description, so a
+    transaction that re-enters the lock through a helper would block on
+    itself. Depth is tracked per thread; only the outermost acquisition
+    touches the file lock.
     """
 
     def __init__(self, directory=None):
         self._dir = directory or DATA_DIR
-        self._fh = None
 
     def __enter__(self):
-        os.makedirs(self._dir, exist_ok=True)
-        self._fh = open(os.path.join(self._dir, _STATE_LOCK_NAME), "a+")
-        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        depth = getattr(_LOCK_STATE, "depth", 0)
+        if depth == 0:
+            os.makedirs(self._dir, exist_ok=True)
+            fh = open(os.path.join(self._dir, _STATE_LOCK_NAME), "a+")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            _LOCK_STATE.fh = fh
+        _LOCK_STATE.depth = depth + 1
         return self
 
     def __exit__(self, *exc_info):
-        if self._fh is not None:
-            try:
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-            finally:
-                self._fh.close()
-                self._fh = None
+        depth = getattr(_LOCK_STATE, "depth", 1) - 1
+        _LOCK_STATE.depth = depth
+        if depth <= 0:
+            fh = getattr(_LOCK_STATE, "fh", None)
+            if fh is not None:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fh.close()
+                    _LOCK_STATE.fh = None
+            _LOCK_STATE.depth = 0
         return False
 
 
@@ -221,6 +238,24 @@ def save_thresholds(thresholds):
         print(f"WARN: Failed to write thresholds: {e}", file=sys.stderr)
 
 
+def tune_and_publish(noise_rate_pct, signal_rate_pct, acquisition_outcome=None):
+    """Load, decide and publish thresholds as ONE transaction.
+
+    The previous sequence loaded thresholds, tuned, then saved. Two
+    overlapping runs could both load 100, one apply 100 -> 75, and the other
+    publish its stale 100 decision — erasing the adjustment and one history
+    event. Re-reading inside the lock means the decision is always made
+    against the current settings.
+    """
+    with StateLock():
+        current = load_thresholds()
+        updated, actions = self_tune(
+            current, noise_rate_pct, signal_rate_pct, acquisition_outcome
+        )
+        save_thresholds(updated)
+        return updated, actions
+
+
 def build_queries(thresholds):
     """Build query dicts with dynamic star thresholds applied.
     For primary/language queries: enforce global threshold as floor.
@@ -307,12 +342,21 @@ def _adjust_threshold(thresholds, direction, step_multiplier=1):
     return old, old, False
 
 
-def self_tune(thresholds, noise_rate_pct, signal_rate_pct):
+def self_tune(thresholds, noise_rate_pct, signal_rate_pct, acquisition_outcome=None):
     """
     Read recent metrics and adjust thresholds based on signal quality.
     Returns (updated_thresholds, tuning_actions_log) where tuning_actions_log
     is a list of human-readable strings describing what changed.
     """
+    # Eligibility: a run whose acquisition was not clean is not an
+    # observation. An outage produces 0% signal, which used to be fed to the
+    # controller as if the query policy had genuinely failed.
+    if acquisition_outcome not in (None, ACQ_OK):
+        return thresholds, [
+            f"SKIP: acquisition {acquisition_outcome} — not tuning from an "
+            f"incomplete scan (star_threshold stays at {thresholds['star_threshold']})"
+        ]
+
     actions = []
     metrics = load_metrics()
 
@@ -423,12 +467,66 @@ def gh_auth_token():
     return gh_auth_token._token
 
 
+# Acquisition outcomes. Every failure used to collapse to ([], 0), which is
+# indistinguishable from a genuinely empty search: an outage looked like a
+# clean scan and self_tune consumed it as a real observation.
+ACQ_OK = "ok"
+ACQ_NO_AUTH = "unauthenticated"
+ACQ_FORBIDDEN = "permission_denied"
+ACQ_RATE_LIMITED = "rate_limited"
+ACQ_TIMEOUT = "timeout"
+ACQ_ERROR = "error"
+
+_ACQ_SEVERITY = {
+    ACQ_OK: 0,
+    ACQ_RATE_LIMITED: 1,
+    ACQ_TIMEOUT: 2,
+    ACQ_ERROR: 3,
+    ACQ_FORBIDDEN: 4,
+    ACQ_NO_AUTH: 5,
+}
+
+_acquisition = {"calls": 0, "counts": {}, "detail": ""}
+
+
+def reset_acquisition():
+    """Start a fresh per-run acquisition record."""
+    _acquisition["calls"] = 0
+    _acquisition["counts"] = {}
+    _acquisition["detail"] = ""
+
+
+def record_acquisition(outcome, detail=""):
+    """Record one request/source/page outcome for this run."""
+    _acquisition["calls"] += 1
+    _acquisition["counts"][outcome] = _acquisition["counts"].get(outcome, 0) + 1
+    if detail:
+        _acquisition["detail"] = detail
+
+
+def acquisition_status():
+    """Aggregate outcome for the whole run; the worst class seen governs."""
+    counts = dict(_acquisition["counts"])
+    worst = ACQ_OK
+    for outcome in counts:
+        if _ACQ_SEVERITY.get(outcome, 3) > _ACQ_SEVERITY.get(worst, 0):
+            worst = outcome
+    return {
+        "calls": _acquisition["calls"],
+        "counts": counts,
+        "worst": worst,
+        "partial": any(o != ACQ_OK for o in counts),
+        "detail": _acquisition["detail"],
+    }
+
+
 def github_search(query, sort="stars", order="desc", per_page=100, page=1):
-    """Call GitHub Search API. Returns (items, total_count) or ([], 0).
+    """Call GitHub Search API. Returns (items, total_count).
     Returns ([], -1) on rate-limit (HTTP 403/429) so callers can bail.
     """
     token = gh_auth_token()
     if not token:
+        record_acquisition(ACQ_NO_AUTH, "no GitHub token")
         return [], 0
 
     pushed_q, created_q = get_date_filters()
@@ -449,13 +547,25 @@ def github_search(query, sort="stars", order="desc", per_page=100, page=1):
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
             items = data.get("items", [])
+            record_acquisition(ACQ_OK)
             return items, data.get("total_count", 0)
     except urllib.error.HTTPError as e:
         print(f"WARN: GitHub API error {e.code} for query '{query[:60]}': {e.reason}", file=sys.stderr)
+        if e.code == 429:
+            record_acquisition(ACQ_RATE_LIMITED, f"HTTP {e.code}")
+        elif e.code == 403:
+            record_acquisition(ACQ_FORBIDDEN, f"HTTP {e.code}")
+        else:
+            record_acquisition(ACQ_ERROR, f"HTTP {e.code}")
         if e.code in (403, 429):
             return [], -1  # rate-limited sentinel
         return [], 0
+    except (TimeoutError, urllib.error.URLError) as e:
+        record_acquisition(ACQ_TIMEOUT, str(e))
+        print(f"WARN: GitHub API timeout: {e}", file=sys.stderr)
+        return [], 0
     except Exception as e:
+        record_acquisition(ACQ_ERROR, str(e))
         print(f"WARN: GitHub API exception: {e}", file=sys.stderr)
         return [], 0
 
@@ -712,74 +822,295 @@ def load_cache_v2():
     return set(), {}
 
 
-def save_cache_v2(seen_set, pushed_map=None):
-    """
-    Save cache preserving first-seen timestamps + updating last_pushed.
+def cache_entry_is_active(entry, now=None):
+    """True when a stored cache entry is still inside the TTL window."""
+    now = now or datetime.now(timezone.utc)
+    first_seen = entry if isinstance(entry, str) else (
+        entry.get("first_seen", "") if isinstance(entry, dict) else ""
+    )
+    try:
+        seen_date = datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    return (now - seen_date).days < CACHE_TTL_DAYS
 
-    seen_set: set of repo full_names to keep in cache
-    pushed_map: optional {name: pushed_at_str} to update timestamps
+
+def save_cache_v2(seen_set, pushed_map=None, checked_set=None):
+    """Persist the cache, merging against the live store under the lock.
+
+    Rewriting only the caller's snapshot deleted names another run added
+    while this one was collecting, so the merge happens against the store as
+    it stands now. Expired entries are dropped, keeping the merge bounded by
+    the documented TTL rather than an unbounded union.
+
+    last_checked advances only for repos this run actually returned; a
+    tracked entry nobody verified keeps its previous timestamp.
     """
     try:
+        os.makedirs(DATA_DIR, exist_ok=True)
         with StateLock():
-            os.makedirs(DATA_DIR, exist_ok=True)
-            now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            now_dt = datetime.now(timezone.utc)
+            now_str = now_dt.isoformat().replace("+00:00", "Z")
 
-            # Load existing data to preserve first_seen
-            old_entries = {}
+            stored = {}
             if os.path.exists(CACHE_FILE):
                 try:
                     with open(CACHE_FILE, encoding="utf-8") as f:
-                        old_data = json.load(f)
-                    old_seen = old_data.get("seen", {})
-                    if isinstance(old_seen, dict):
-                        for repo, entry in old_seen.items():
-                            if isinstance(entry, str):
-                                old_entries[repo] = {"first_seen": entry, "last_pushed": "", "last_checked": ""}
-                            elif isinstance(entry, dict):
-                                old_entries[repo] = entry
+                        data = json.load(f)
+                    seen_data = data.get("seen", {})
+                    if isinstance(seen_data, dict):
+                        stored = seen_data
                 except (json.JSONDecodeError, KeyError):
-                    pass
+                    stored = {}
 
-            # Build merged dict: preserve first_seen for known repos, stamp new ones
             new_entries = {}
+            for repo, entry in stored.items():
+                if cache_entry_is_active(entry, now_dt):
+                    new_entries[repo] = dict(entry) if isinstance(entry, dict) else {
+                        "first_seen": entry, "last_pushed": "", "last_checked": ""
+                    }
+
             preserved = 0
             new_count = 0
             for repo in seen_set:
-                if repo in old_entries:
-                    entry = dict(old_entries[repo])
-                    # Update last_pushed if we have new data
-                    if pushed_map and repo in pushed_map and pushed_map[repo]:
-                        entry["last_pushed"] = pushed_map[repo]
-                    entry["last_checked"] = now_str
+                if repo in new_entries:
+                    entry = dict(new_entries[repo])
+                    incoming = (pushed_map or {}).get(repo)
+                    current = entry.get("last_pushed", "")
+                    if incoming and (not current or incoming > current):
+                        entry["last_pushed"] = incoming
+                    if checked_set is None or repo in checked_set:
+                        entry["last_checked"] = now_str
                     new_entries[repo] = entry
                     preserved += 1
                 else:
+                    was_checked = checked_set is None or repo in checked_set
                     new_entries[repo] = {
                         "first_seen": now_str,
                         "last_pushed": (pushed_map or {}).get(repo, ""),
-                        "last_checked": now_str,
+                        "last_checked": now_str if was_checked else "",
                     }
                     new_count += 1
 
             if new_count > 0 or preserved > 0:
                 print(f"CACHE: {preserved} preserved, {new_count} new entries", file=sys.stderr)
-
             atomic_write_json(CACHE_FILE, {"seen": new_entries})
     except Exception as e:
         print(f"WARN: Failed to write cache: {e}", file=sys.stderr)
 
 
-# ── Scoring (generic, community edition) ────────────────────────────
+# ── Bounded per-identity rechecks ────────────────────────────────────
+#
+# A repo discovery no longer returns has still not been checked. The
+# per-run cap is an operator/API-budget decision, so this stays disabled
+# with a truthful reason until that budget is configured; no quota is
+# invented here.
 
-# Generic relevance keywords (community edition — not Hermes-specific)
-RELEVANCE_KEYWORDS = [
-    "agent", "llm", "ai", "ml", "rag", "vector", "embedding", "transformer",
-    "python", "rust", "go", "typescript", "javascript", "react", "vue", "svelte",
-    "cli", "tui", "terminal", "tool", "framework", "library", "sdk", "api",
-    "mcp", "plugin", "skill", "workflow", "orchestration", "automation",
-    "scraper", "crawler", "parser", "compiler", "linter", "formatter",
-]
-RELEVANCE_WEIGHT = 10  # per-keyword hit
+RECHECK_BUDGET_ENV = "GITHUB_RADAR_RECHECK_BUDGET"
+RECHECK_QUEUE_FILE = os.path.join(DATA_DIR, "recheck-queue.json")
+
+
+def recheck_budget(explicit=None):
+    """Operator-supplied per-run recheck cap, or None when unset/invalid."""
+    if explicit is not None:
+        try:
+            return int(explicit) if int(explicit) > 0 else None
+        except (TypeError, ValueError):
+            return None
+    raw = (os.environ.get(RECHECK_BUDGET_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def load_recheck_queue():
+    if not os.path.exists(RECHECK_QUEUE_FILE):
+        return {"pending": [], "checked_through": None}
+    try:
+        with open(RECHECK_QUEUE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"pending": [], "checked_through": None}
+        return {
+            "pending": [str(x) for x in data.get("pending", [])],
+            "checked_through": data.get("checked_through"),
+        }
+    except (json.JSONDecodeError, OSError):
+        return {"pending": [], "checked_through": None}
+
+
+def save_recheck_queue(queue):
+    with StateLock():
+        atomic_write_json(RECHECK_QUEUE_FILE, {
+            "pending": list(queue.get("pending", [])),
+            "checked_through": queue.get("checked_through"),
+        })
+
+
+def plan_rechecks(tracked_ids, budget, queue=None):
+    """Pick at most `budget` identities, keeping a durable backlog."""
+    queue = queue if queue is not None else load_recheck_queue()
+    pending = list(queue.get("pending", []))
+    seen = set(pending)
+    for ident in tracked_ids:
+        if ident not in seen:
+            pending.append(ident)
+            seen.add(ident)
+    return pending[:budget], pending[budget:]
+
+
+def run_rechecks(identities, fetch=None, budget=None):
+    """Recheck a bounded batch; counters separate queried from not-queried."""
+    fetch = fetch or _repo_metadata
+    counters = {
+        "attempted": 0, "checked": 0, "changed": 0, "unchanged": 0,
+        "unavailable": 0, "failed": 0, "deferred": 0,
+    }
+    _, pushed_map = load_cache_v2()
+    for ident in identities:
+        counters["attempted"] += 1
+        try:
+            data = fetch(ident)
+        except Exception:
+            counters["failed"] += 1
+            record_acquisition(ACQ_ERROR, f"recheck failed for {ident}")
+            continue
+        if not data:
+            counters["unavailable"] += 1
+            record_acquisition(ACQ_ERROR, f"recheck unavailable for {ident}")
+            continue
+        counters["checked"] += 1
+        new_pushed = data.get("pushed_at", "")
+        old_pushed = pushed_map.get(ident, "")
+        if new_pushed and old_pushed and new_pushed > old_pushed:
+            counters["changed"] += 1
+        else:
+            counters["unchanged"] += 1
+    counters["budget"] = budget
+    return counters
+
+
+def recheck_tracked(budget=None, fetch=None):
+    """Operator-gated entry point for identity-based rechecks."""
+    resolved = recheck_budget(budget)
+    if not resolved:
+        return {
+            "enabled": False,
+            "reason": (
+                f"no per-run recheck budget configured "
+                f"(set {RECHECK_BUDGET_ENV}); identities were not rechecked"
+            ),
+            "attempted": 0, "checked": 0, "deferred": 0, "not_queried": 0,
+        }
+    queue = load_recheck_queue()
+    active_cache, _ = load_cache_v2()
+    batch, remaining = plan_rechecks(sorted(active_cache), resolved, queue)
+    counters = run_rechecks(batch, fetch=fetch, budget=resolved)
+    counters["not_queried"] = len(remaining)
+    counters["deferred"] = len(remaining)
+    counters["enabled"] = True
+    save_recheck_queue({"pending": remaining, "checked_through": batch[-1] if batch else None})
+    return counters
+
+
+def _repo_metadata(full_name, timeout=10):
+    """Fetch one repo's metadata; None when unavailable."""
+    token = gh_auth_token()
+    url = f"https://api.github.com/repos/{full_name}"
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "GitRadar/1.0")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+# ── Outcome recording (minimal, local) ───────────────────────────────
+
+OUTCOMES_FILE = os.path.join(DATA_DIR, "outcomes.json")
+OUTCOME_STATES = ("irrelevant", "already-known", "investigate", "tried", "useful")
+
+METRIC_LABEL_NOTE = (
+    "filter_accepted counts findings that passed filtering; it is not a "
+    "measure of usefulness or adoption"
+)
+
+
+def finding_identity(repo_or_name):
+    """Stable identity for a finding, independent of run or casing."""
+    name = repo_or_name if isinstance(repo_or_name, str) else repo_or_name.get("full_name", "")
+    return str(name).strip().lower()
+
+
+def load_outcomes():
+    if not os.path.exists(OUTCOMES_FILE):
+        return {"schema": 1, "events": {}}
+    try:
+        with open(OUTCOMES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "events" not in data:
+            return {"schema": 1, "events": {}}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"schema": 1, "events": {}}
+
+
+def record_outcome(finding, state, note=None, source="local"):
+    """Record one outcome per (finding, state), deduplicated."""
+    if state not in OUTCOME_STATES:
+        raise ValueError(f"unknown outcome state {state!r}; expected one of {OUTCOME_STATES}")
+    ident = finding_identity(finding)
+    if not ident:
+        raise ValueError("finding identity must be non-empty")
+    key = f"{ident}|{state}"
+    with StateLock():
+        data = load_outcomes()
+        events = data.setdefault("events", {})
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        event = events.get(key)
+        if event is None:
+            events[key] = {
+                "finding": ident, "state": state, "count": 1,
+                "first_at": now, "last_at": now, "source": source,
+                "note": note or "",
+            }
+        else:
+            event["count"] = int(event.get("count", 1)) + 1
+            event["last_at"] = now
+            if note:
+                event["note"] = note
+        atomic_write_json(OUTCOMES_FILE, data)
+        return dict(events[key])
+
+
+def read_outcomes(ident=None, state=None):
+    data = load_outcomes()
+    rows = list(data.get("events", {}).values())
+    if ident is not None:
+        key = finding_identity(ident)
+        rows = [r for r in rows if r.get("finding") == key]
+    if state is not None:
+        rows = [r for r in rows if r.get("state") == state]
+    return sorted(rows, key=lambda r: r.get("last_at", ""))
+
+
+def outcome_summary():
+    data = load_outcomes()
+    counts = {state: 0 for state in OUTCOME_STATES}
+    for event in data.get("events", {}).values():
+        state = event.get("state")
+        if state in counts:
+            counts[state] += int(event.get("count", 0))
+    counts["no_outcome_recorded"] = None
+    return counts
 
 
 def score_repo(repo):
@@ -926,6 +1257,7 @@ def collect_daily(queries):
     """
     active_cache, pushed_map = load_cache_v2()
     seen = set(active_cache)
+    discovered = set()  # repos this run actually returned
     all_repos = []
     rate_limited = False
 
@@ -947,7 +1279,8 @@ def collect_daily(queries):
                 break
             for item in items:
                 full_name = item.get("full_name", "")
-                if full_name and full_name not in seen:
+                if full_name and full_name not in discovered:
+                    discovered.add(full_name)
                     seen.add(full_name)
                     all_repos.append(extract_repo(item))
             page += 1
@@ -958,7 +1291,8 @@ def collect_daily(queries):
     trending_new = 0
     for t in trending:
         name = t["full_name"]
-        if name not in seen:
+        if name not in discovered:
+            discovered.add(name)
             seen.add(name)
             # Keep what enrichment actually returned. Rebuilding the row
             # with stars=0 threw the fetched metadata away and made every
@@ -977,7 +1311,7 @@ def collect_daily(queries):
                 "license": t.get("license", ""),
                 "html_url": t.get("html_url") or f"https://github.com/{name}",
                 "source": t.get("source", "trending"),
-                "metadata_status": t.get("metadata_status", "complete"),
+                "metadata_status": t.get("metadata_status", "unknown"),
             })
             trending_new += 1
 
@@ -1013,7 +1347,11 @@ def collect_weekly(queries):
     """
     active_cache, pushed_map = load_cache_v2()
     all_repos = []
-    seen = set()  # session dedup (across queries), not cache dedup
+    # `seen` is written back, so it must start from the tracked cache: it
+    # previously began empty, which replaced the whole 14-day watchlist with
+    # whatever one scan returned.
+    seen = set(active_cache)
+    discovered = set()  # repos this run actually returned
     rate_limited = False
 
     # Phase 1: Full API scan — find ALL matching repos, including cached ones
@@ -1034,7 +1372,8 @@ def collect_weekly(queries):
                 break
             for item in items:
                 full_name = item.get("full_name", "")
-                if full_name and full_name not in seen:
+                if full_name and full_name not in discovered:
+                    discovered.add(full_name)
                     seen.add(full_name)
                     all_repos.append(extract_repo(item))
             page += 1
@@ -1044,7 +1383,8 @@ def collect_weekly(queries):
     trending = enrich_trending_repos(trending)
     for t in trending:
         name = t["full_name"]
-        if name not in seen:
+        if name not in discovered:
+            discovered.add(name)
             seen.add(name)
             # Keep what enrichment actually returned. Rebuilding the row
             # with stars=0 threw the fetched metadata away and made every
@@ -1063,11 +1403,14 @@ def collect_weekly(queries):
                 "license": t.get("license", ""),
                 "html_url": t.get("html_url") or f"https://github.com/{name}",
                 "source": t.get("source", "trending"),
-                "metadata_status": t.get("metadata_status", "complete"),
+                "metadata_status": t.get("metadata_status", "unknown"),
             })
 
     # Phase 3: Compare against cached pushed_at
-    re_evaluated = len(active_cache)
+    checked = discovered & active_cache          # tracked AND seen again
+    unavailable = active_cache - discovered      # tracked, not returned
+    not_queried = set()                          # no bounded recheck queue yet
+    re_evaluated = len(checked)
     with_new_activity = 0
     new_finds = 0
     for repo in all_repos:
@@ -1089,17 +1432,24 @@ def collect_weekly(queries):
         if r.get("pushed_at"):
             updated_pushed[r["full_name"]] = r["pushed_at"]
 
-    save_cache_v2(seen, updated_pushed)
+    save_cache_v2(seen, updated_pushed, checked_set=discovered)
 
     extra_stats = {
         "re_evaluated": re_evaluated,
         "with_new_activity": with_new_activity,
         "new_finds": new_finds,
         "total_in_scope": len(seen),
+        # Coverage, stated honestly. Cache size is inventory, not checks.
+        "cache_size": len(active_cache),
+        "attempted": len(discovered),
+        "checked": len(checked),
+        "unavailable": len(unavailable),
+        "not_queried": len(not_queried),
     }
     print(
-        f"WEEKLY: re-evaluated {re_evaluated} cached, {with_new_activity} with new activity, "
-        f"{new_finds} new finds",
+        f"WEEKLY: {len(checked)} of {len(active_cache)} tracked repos checked, "
+        f"{len(unavailable)} not returned this run, "
+        f"{with_new_activity} with new activity, {new_finds} new finds",
         file=sys.stderr,
     )
     return all_repos, extra_stats
@@ -1207,7 +1557,9 @@ def build_text_summary(repos, stats, extra_stats):
             elif r.get("new_find"):
                 prefix = "[NEW FIND] "
             score = r.get("score", 0)
-            stars = r.get("stars", 0)
+            # Unknown metadata must read as unknown, never as a measured 0.
+            stars = r.get("stars")
+            stars = "unknown" if stars is None else stars
             lang = r.get("language") or "—"
             desc = _truncate(r.get("description", ""), 70)
             lines.append(
@@ -1260,9 +1612,12 @@ def main():
     noise_rate_pct = round((noise_count / total * 100), 1) if total > 0 else 0.0
     signal_rate_pct = round((signal_count / total * 100), 1) if total > 0 else 0.0
 
-    # Stage 3: Self-tuning
-    thresholds, tuning_actions = self_tune(thresholds, noise_rate_pct, signal_rate_pct)
-    save_thresholds(thresholds)
+    # Stage 3: Self-tuning from aggregated acquisition status only, as one
+    # transaction so a concurrent writer cannot overwrite the decision.
+    acquisition = acquisition_status()
+    thresholds, tuning_actions = tune_and_publish(
+        noise_rate_pct, signal_rate_pct, acquisition["worst"]
+    )
 
     print("TUNING:", file=sys.stderr)
     for action in tuning_actions:
@@ -1312,6 +1667,8 @@ def main():
         "mode": MODE,
         "total_repos": total,
         "actionable": signal_count,
+        "filter_accepted": signal_count,
+        "metric_label_note": METRIC_LABEL_NOTE,
         "noise": noise_count,
         "signal_rate_pct": signal_rate_pct,
         "noise_rate_pct": noise_rate_pct,

@@ -139,7 +139,15 @@ def parse_date(date_str):
         return None
 
 def stars_score(stars):
-    """Score based on stars using log scale."""
+    """Score based on stars using log scale.
+
+    ``stars`` may be None when metadata could not be fetched. That is an
+    unknown measurement, not a measured zero: it contributes no star score
+    and must not raise, so the row can still be scored, classified and
+    rendered as unknown rather than crashing the run.
+    """
+    if stars is None:
+        return 0.0
     if stars <= 0:
         return 0.0
     # log10(stars+1) * 5, capped at 20
@@ -204,8 +212,8 @@ def topic_bonus_score(topics, stack):
 
 def compute_score(repo, stack):
     """Compute the total score for a repo."""
-    # Stars
-    s_score = stars_score(repo.get("stars", 0))
+    # Stars — None means unknown, and contributes no star score.
+    s_score = stars_score(repo.get("stars"))
     # Recency
     r_score = recency_score(repo.get("created_at", ""))
     # Language
