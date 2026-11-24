@@ -391,6 +391,71 @@ class GitRadarTrendingMetadataTests(unittest.TestCase):
                       f"Trending row filtered out: {reasons}")
 
 
+class GitRadarScoringContractTests(unittest.TestCase):
+    """The documented output contract must be produced by the real path."""
+
+    def setUp(self):
+        self.discover = load_module("gitradar_discover_scoring", "scripts/gitradar-discover.py")
+
+    @staticmethod
+    def repo(name, stars, description="agent tooling mcp server plugin"):
+        return {
+            "full_name": name, "description": description, "stars": stars, "forks": 1,
+            "language": "Python", "topics": ["llm", "mcp"],
+            "created_at": "2026-11-01T00:00:00Z", "pushed_at": "2026-11-20T00:00:00Z",
+            "open_issues": 0, "license": "MIT",
+            "html_url": f"https://github.com/{name}", "source": "api",
+            "metadata_status": "complete",
+        }
+
+    def test_documented_fields_are_emitted(self):
+        """README documents `classification` and `why`; nothing produced them."""
+        rows = self.discover.score_all([self.repo("acme/alpha", 2000)])
+        for row in rows:
+            self.assertIn("score", row)
+            self.assertIn("classification", row)
+            self.assertIn("why", row)
+            self.assertTrue(row["why"], "rationale must be non-empty")
+
+    def test_classification_uses_the_configured_stack(self):
+        """config/stack.json is the documented scoring source."""
+        rows = self.discover.score_all([self.repo("acme/alpha", 2000)])
+        self.assertEqual(rows[0]["score_source"], "config/stack.json")
+
+    def test_scoring_agrees_with_the_scoring_script(self):
+        """One scoring implementation, not two that disagree."""
+        scoring = load_module("gitradar_score_contract", "scripts/gitradar-score.py")
+        stack = scoring.load_stack()
+        rows = self.discover.score_all([
+            self.repo("acme/huge", 90000),
+            self.repo("acme/mid", 2000),
+            self.repo("acme/low", 5, ""),
+        ])
+        for row in rows:
+            self.assertEqual(
+                row["classification"],
+                scoring.classify_repo(scoring.compute_score(row, stack)),
+                f"{row['full_name']} labelled differently by the two scorers",
+            )
+
+    def test_rows_are_sorted_by_score_descending(self):
+        rows = self.discover.score_all([
+            self.repo("acme/low", 5, ""),
+            self.repo("acme/huge", 90000),
+        ])
+        self.assertEqual([r["full_name"] for r in rows], ["acme/huge", "acme/low"])
+
+    def test_zero_star_repo_is_labelled_not_dropped(self):
+        """A measured-zero repo still gets a documented label, not a crash."""
+        rows = self.discover.score_all([self.repo("acme/dead", 0, "")])
+        self.assertIn(rows[0]["classification"], {
+            "ADOPT", "EXTRACT", "FORK/PRODUCT", "PLUGIN/SKILL", "INSPIRATION", "NOISE",
+        })
+        self.assertIn("score", rows[0])
+        # The configured stack still weighs it; it is not silently discarded.
+        self.assertEqual(len(rows), 1)
+
+
 class GitRadarScoreTests(unittest.TestCase):
     def setUp(self):
         self.score = load_module("gitradar_score", "scripts/gitradar-score.py")

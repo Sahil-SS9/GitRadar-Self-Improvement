@@ -756,11 +756,97 @@ def score_repo(repo):
     return score
 
 
+# ── Scoring ─────────────────────────────────────────────────────────
+#
+# README: "Define your technology stack for scoring in config/stack.json".
+# This script is the one that actually writes discoveries.json, but it used
+# its own hardcoded keyword scorer and never consulted stack.json — so the
+# configured preferences had no effect on the published output, and the
+# documented `classification` field was emitted by nothing at all
+# (gitradar-score.py computes it but is not on this path).
+#
+# Load the config-driven scorer from the sibling script so there is exactly
+# one scoring implementation, and emit the documented fields from here.
+
+_SCORE_MODULE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gitradar-score.py")
+_score_module = None
+
+
+def _load_score_module():
+    """Import the sibling scoring script; None when unavailable."""
+    global _score_module
+    if _score_module is not None:
+        return _score_module
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("gitradar_score", _SCORE_MODULE_PATH)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _score_module = module
+        return module
+    except Exception as e:
+        print(f"WARN: config-driven scorer unavailable ({e}); using fallback", file=sys.stderr)
+        return None
+
+
+CLASSIFICATION_REASONS = {
+    "ADOPT": "High-score repo: evaluate for adoption before installing.",
+    "EXTRACT": "Strong match: worth extracting concepts or patterns.",
+    "FORK/PRODUCT": "Could become a standalone product or fork.",
+    "PLUGIN/SKILL": "Useful tooling or extension point worth trialling.",
+    "INSPIRATION": "Moderate signal: file for future reference.",
+    "NOISE": "Low signal against the configured stack.",
+}
+
+
+def classify_score(score):
+    """Fallback banding, used only when the scoring script cannot be loaded."""
+    for floor, label in ((80, "ADOPT"), (60, "EXTRACT"), (50, "FORK/PRODUCT"),
+                         (40, "PLUGIN/SKILL"), (20, "INSPIRATION"), (0, "NOISE")):
+        if score >= floor:
+            return label
+    return "NOISE"
+
+
 def score_all(repos):
-    """Attach a numeric score to each repo and sort by score descending."""
+    """Score, classify and explain every repo, then sort by score descending.
+
+    Uses the documented config/stack.json preferences through
+    gitradar-score.py so the configured stack actually shapes the output.
+    The rationale is deterministic — it states the score and label — and is
+    kept separate from any optional prose so rewriting wording cannot erase
+    why a label was assigned.
+    """
+    module = _load_score_module()
+    stack = None
+    if module is not None:
+        try:
+            stack = module.load_stack()
+        except Exception as e:
+            print(f"WARN: could not load stack preferences ({e})", file=sys.stderr)
+            module = None
+
+    scored = []
     for r in repos:
-        r["score"] = score_repo(r)
-    return sorted(repos, key=lambda x: x.get("score", 0), reverse=True)
+        if module is not None:
+            score = round(module.compute_score(r, stack), 2)
+            label = module.classify_repo(score)
+        else:
+            score = score_repo(r)
+            label = classify_score(score)
+        r["score"] = score
+        r["classification"] = label
+        r["why"] = f"{CLASSIFICATION_REASONS.get(label, '')} (score {score}, {label})"
+        r["score_source"] = "config/stack.json" if module is not None else "builtin-keywords"
+        scored.append(r)
+
+    if module is not None:
+        print(f"SCORE: using config/stack.json via gitradar-score.py", file=sys.stderr)
+    else:
+        print("SCORE: config-driven scorer unavailable; builtin keywords only", file=sys.stderr)
+    return sorted(scored, key=lambda x: x.get("score", 0), reverse=True)
 
 
 # ── Collection ──────────────────────────────────────────────────────
