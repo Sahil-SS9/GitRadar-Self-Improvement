@@ -25,7 +25,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import fcntl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,6 +63,72 @@ THRESHOLDS_FILE = os.path.join(DATA_DIR, "thresholds.json")
 
 DATE_STR = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 TIME_STR = datetime.now(timezone.utc).strftime("%H:%M")
+
+# ── Durable publication ─────────────────────────────────────────────
+#
+# Every state file here is read-modify-written, and daily and weekly runs
+# can overlap. A plain open(path, "w") truncates before writing, so a crash
+# or a competing writer could leave a half-written document that still looked
+# like a completed run. Publish through a temp file in the same directory and
+# os.replace() so a reader only ever sees a complete document.
+
+_STATE_LOCK_NAME = ".state.lock"
+
+
+class StateLock:
+    """Exclusive advisory lock around a shared read-modify-write cycle.
+
+    Atomic replacement stops torn files. It does not stop two writers each
+    loading, modifying and saving, where the second silently discards the
+    first's update.
+    """
+
+    def __init__(self, directory=None):
+        self._dir = directory or DATA_DIR
+        self._fh = None
+
+    def __enter__(self):
+        os.makedirs(self._dir, exist_ok=True)
+        self._fh = open(os.path.join(self._dir, _STATE_LOCK_NAME), "a+")
+        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+        return False
+
+
+def atomic_write_text(path, text):
+    """Publish text atomically: temp file, fsync, replace."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".part")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_json(path, data, indent=2):
+    """Serialise and validate first, then publish atomically."""
+    text = json.dumps(data, indent=indent, default=str)
+    json.loads(text)
+    return atomic_write_text(path, text)
+
 
 # ── Static Config ───────────────────────────────────────────────────
 
@@ -148,10 +216,8 @@ def load_thresholds():
 def save_thresholds(thresholds):
     """Persist thresholds to disk."""
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(THRESHOLDS_FILE, "w", encoding="utf-8") as f:
-            json.dump(thresholds, f, indent=2, default=str)
-    except OSError as e:
+        atomic_write_json(THRESHOLDS_FILE, thresholds)
+    except (OSError, ValueError, TypeError) as e:
         print(f"WARN: Failed to write thresholds: {e}", file=sys.stderr)
 
 
@@ -195,16 +261,17 @@ def load_metrics():
 
 def append_metrics_entry(entry):
     """Append a metrics entry, prune to 365 max."""
-    metrics = load_metrics()
-    metrics.append(entry)
-    # Prune to 365 entries
-    if len(metrics) > 365:
-        metrics = metrics[-365:]
+    # Load -> append -> publish must be one critical section, or two overlapping
+    # runs each read the same history and one run's entry is lost.
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(METRICS_FILE, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2)
-    except OSError as e:
+        with StateLock():
+            metrics = load_metrics()
+            metrics.append(entry)
+            # Prune to 365 entries
+            if len(metrics) > 365:
+                metrics = metrics[-365:]
+            atomic_write_json(METRICS_FILE, metrics)
+    except (OSError, ValueError, TypeError) as e:
         print(f"WARN: Failed to write metrics: {e}", file=sys.stderr)
 
 
@@ -653,51 +720,51 @@ def save_cache_v2(seen_set, pushed_map=None):
     pushed_map: optional {name: pushed_at_str} to update timestamps
     """
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with StateLock():
+            os.makedirs(DATA_DIR, exist_ok=True)
+            now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-        # Load existing data to preserve first_seen
-        old_entries = {}
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE, encoding="utf-8") as f:
-                    old_data = json.load(f)
-                old_seen = old_data.get("seen", {})
-                if isinstance(old_seen, dict):
-                    for repo, entry in old_seen.items():
-                        if isinstance(entry, str):
-                            old_entries[repo] = {"first_seen": entry, "last_pushed": "", "last_checked": ""}
-                        elif isinstance(entry, dict):
-                            old_entries[repo] = entry
-            except (json.JSONDecodeError, KeyError):
-                pass
+            # Load existing data to preserve first_seen
+            old_entries = {}
+            if os.path.exists(CACHE_FILE):
+                try:
+                    with open(CACHE_FILE, encoding="utf-8") as f:
+                        old_data = json.load(f)
+                    old_seen = old_data.get("seen", {})
+                    if isinstance(old_seen, dict):
+                        for repo, entry in old_seen.items():
+                            if isinstance(entry, str):
+                                old_entries[repo] = {"first_seen": entry, "last_pushed": "", "last_checked": ""}
+                            elif isinstance(entry, dict):
+                                old_entries[repo] = entry
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-        # Build merged dict: preserve first_seen for known repos, stamp new ones
-        new_entries = {}
-        preserved = 0
-        new_count = 0
-        for repo in seen_set:
-            if repo in old_entries:
-                entry = dict(old_entries[repo])
-                # Update last_pushed if we have new data
-                if pushed_map and repo in pushed_map and pushed_map[repo]:
-                    entry["last_pushed"] = pushed_map[repo]
-                entry["last_checked"] = now_str
-                new_entries[repo] = entry
-                preserved += 1
-            else:
-                new_entries[repo] = {
-                    "first_seen": now_str,
-                    "last_pushed": (pushed_map or {}).get(repo, ""),
-                    "last_checked": now_str,
-                }
-                new_count += 1
+            # Build merged dict: preserve first_seen for known repos, stamp new ones
+            new_entries = {}
+            preserved = 0
+            new_count = 0
+            for repo in seen_set:
+                if repo in old_entries:
+                    entry = dict(old_entries[repo])
+                    # Update last_pushed if we have new data
+                    if pushed_map and repo in pushed_map and pushed_map[repo]:
+                        entry["last_pushed"] = pushed_map[repo]
+                    entry["last_checked"] = now_str
+                    new_entries[repo] = entry
+                    preserved += 1
+                else:
+                    new_entries[repo] = {
+                        "first_seen": now_str,
+                        "last_pushed": (pushed_map or {}).get(repo, ""),
+                        "last_checked": now_str,
+                    }
+                    new_count += 1
 
-        if new_count > 0 or preserved > 0:
-            print(f"CACHE: {preserved} preserved, {new_count} new entries", file=sys.stderr)
+            if new_count > 0 or preserved > 0:
+                print(f"CACHE: {preserved} preserved, {new_count} new entries", file=sys.stderr)
 
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"seen": new_entries}, f, indent=2)
+            atomic_write_json(CACHE_FILE, {"seen": new_entries})
     except Exception as e:
         print(f"WARN: Failed to write cache: {e}", file=sys.stderr)
 
@@ -1234,8 +1301,7 @@ def main():
 
     # Write full output to disk
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, default=str)
+    atomic_write_json(OUTPUT_FILE, output)
 
     # Print clean human-readable summary to stdout
     print(build_text_summary(scored, stats, extra_stats))

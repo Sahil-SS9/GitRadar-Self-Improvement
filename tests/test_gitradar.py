@@ -456,6 +456,78 @@ class GitRadarScoringContractTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
 
 
+class GitRadarDurabilityTests(unittest.TestCase):
+    """State must survive a crash and concurrent writers."""
+
+    def setUp(self):
+        self.discover = load_module("gitradar_discover_durable", "scripts/gitradar-discover.py")
+        self.tmp = tempfile.mkdtemp(prefix="gitradar-durable-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        for attr in ("CACHE_FILE", "OUTPUT_FILE", "METRICS_FILE", "THRESHOLDS_FILE"):
+            setattr(self.discover, attr, os.path.join(self.tmp, os.path.basename(getattr(self.discover, attr))))
+
+    def test_write_is_atomic_and_leaves_no_temp_files(self):
+        target = os.path.join(self.tmp, "artefact.txt")
+        self.discover.atomic_write_text(target, "content")
+        self.assertEqual(pathlib.Path(target).read_text(), "content")
+        leftovers = [n for n in os.listdir(self.tmp) if n.startswith(".tmp-")]
+        self.assertEqual(leftovers, [])
+
+    def test_crash_mid_publish_keeps_previous_artefact(self):
+        target = os.path.join(self.tmp, "discoveries.json")
+        pathlib.Path(target).write_text('{"previous": "good run"}')
+
+        def exploding_fsync(fd):
+            raise OSError("simulated crash before publish")
+
+        with mock.patch.object(self.discover.os, "fsync", side_effect=exploding_fsync):
+            with self.assertRaises(OSError):
+                self.discover.atomic_write_json(target, {"repos": list(range(100))})
+
+        self.assertEqual(
+            pathlib.Path(target).read_text(), '{"previous": "good run"}',
+            "a failed publish destroyed the last good artefact",
+        )
+
+    def test_metrics_appends_are_not_lost_under_concurrency(self):
+        import threading
+
+        errors = []
+
+        def worker(i):
+            try:
+                self.discover.append_metrics_entry({"run": i})
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        self.assertEqual(errors, [])
+        written = json.loads(pathlib.Path(self.discover.METRICS_FILE).read_text())
+        self.assertEqual(sorted(e["run"] for e in written), list(range(6)))
+
+    def test_state_lock_is_exclusive(self):
+        import threading
+
+        acquired = threading.Event()
+        with self.discover.StateLock():
+            def contender():
+                with self.discover.StateLock():
+                    acquired.set()
+            threading.Thread(target=contender, daemon=True).start()
+            self.assertFalse(acquired.wait(timeout=0.5), "lock allowed a concurrent holder")
+        self.assertTrue(acquired.wait(timeout=5.0))
+
+    def test_cache_written_by_the_real_path_is_parseable(self):
+        self.discover.save_cache_v2({"acme/alpha"}, {"acme/alpha": "2026-11-20T00:00:00Z"})
+        written = json.loads(pathlib.Path(self.discover.CACHE_FILE).read_text())
+        self.assertIn("acme/alpha", written["seen"])
+
+
 class GitRadarScoreTests(unittest.TestCase):
     def setUp(self):
         self.score = load_module("gitradar_score", "scripts/gitradar-score.py")
