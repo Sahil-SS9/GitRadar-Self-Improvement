@@ -1039,6 +1039,7 @@ def run_rechecks(identities, fetch=None, budget=None):
         "attempted": 0, "checked": 0, "changed": 0, "unchanged": 0,
         "unavailable": 0, "failed": 0, "deferred": 0,
     }
+    observations = {}
     _, pushed_map = load_cache_v2()
     for ident in identities:
         counters["attempted"] += 1
@@ -1055,16 +1056,19 @@ def run_rechecks(identities, fetch=None, budget=None):
         counters["checked"] += 1
         new_pushed = data.get("pushed_at", "")
         old_pushed = pushed_map.get(ident, "")
+        if new_pushed:
+            observations[ident] = new_pushed
         if new_pushed and old_pushed and new_pushed > old_pushed:
             counters["changed"] += 1
         else:
             counters["unchanged"] += 1
     counters["budget"] = budget
+    counters["observations"] = observations
     return counters
 
 
-def recheck_tracked(budget=None, fetch=None):
-    """Operator-gated entry point for identity-based rechecks."""
+def recheck_tracked(budget=None, fetch=None, identities=None):
+    """Operator-gated identity rechecks; off until a budget is configured."""
     resolved = recheck_budget(budget)
     if not resolved:
         return {
@@ -1074,11 +1078,21 @@ def recheck_tracked(budget=None, fetch=None):
                 f"(set {RECHECK_BUDGET_ENV}); identities were not rechecked"
             ),
             "attempted": 0, "checked": 0, "deferred": 0, "not_queried": 0,
+            "observations": {},
         }
     queue = load_recheck_queue()
-    active_cache, _ = load_cache_v2()
-    batch, remaining = plan_rechecks(sorted(active_cache), resolved, queue)
+    if identities is None:
+        active_cache, _ = load_cache_v2()
+        identities = sorted(active_cache)
+    batch, remaining = plan_rechecks(sorted(identities), resolved, queue)
     counters = run_rechecks(batch, fetch=fetch, budget=resolved)
+
+    observations = counters.pop("observations", {})
+    if observations:
+        active_after, _ = load_cache_v2()
+        save_cache_v2(set(active_after) | set(observations), observations,
+                      checked_set=set(observations))
+
     counters["not_queried"] = len(remaining)
     counters["deferred"] = len(remaining)
     counters["enabled"] = True
@@ -1503,17 +1517,39 @@ def collect_weekly(queries):
 
     save_cache_v2(seen, updated_pushed, checked_set=discovered)
 
+    # Identity rechecks for tracked repos discovery did not return. This is
+    # the caller the helper exists for; it stays disabled with a truthful
+    # reason until an operator configures a budget.
+    recheck = recheck_tracked(identities=sorted(unavailable))
+    recheck_attempted = recheck.get("attempted", 0) if recheck.get("enabled") else 0
+    unqueried = max(0, len(unavailable) - recheck_attempted)
+
     extra_stats = {
-        "re_evaluated": re_evaluated,
+        "re_evaluated": len(checked) + (recheck.get("checked", 0) if recheck.get("enabled") else 0),
         "with_new_activity": with_new_activity,
         "new_finds": new_finds,
         "total_in_scope": len(seen),
         # Coverage, stated honestly. Cache size is inventory, not checks.
         "cache_size": len(active_cache),
-        "attempted": len(discovered),
-        "checked": len(checked),
-        "unavailable": len(unavailable),
-        "not_queried": len(not_queried),
+        "attempted": len(discovered) + recheck_attempted,
+        "checked": len(checked) + (recheck.get("checked", 0) if recheck.get("enabled") else 0),
+        # Not returned by discovery is not "unavailable" — it was not queried
+        # unless the bounded recheck actually attempted it.
+        "not_queried": unqueried,
+        "recheck_unavailable": recheck.get("unavailable", 0) if recheck.get("enabled") else 0,
+        "deferred": recheck.get("deferred", 0) if recheck.get("enabled") else 0,
+        "recheck": {
+            "enabled": bool(recheck.get("enabled")),
+            "reason": recheck.get("reason", ""),
+            "budget": recheck.get("budget"),
+            "attempted": recheck_attempted,
+            "checked": recheck.get("checked", 0),
+            "changed": recheck.get("changed", 0),
+            "unchanged": recheck.get("unchanged", 0),
+            "unavailable": recheck.get("unavailable", 0),
+            "failed": recheck.get("failed", 0),
+            "deferred": recheck.get("deferred", 0),
+        },
     }
     print(
         f"WEEKLY: {len(checked)} of {len(active_cache)} tracked repos checked, "

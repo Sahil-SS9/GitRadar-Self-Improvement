@@ -369,6 +369,62 @@ class R5Coverage(unittest.TestCase):
         self.assertGreater(second["deferred"], 0, "backlog not reported")
 
 
+    def test_weekly_invokes_recheck_and_persists_observed_facts(self):
+        """R5: the helper is wired into weekly and stores real observations."""
+        self.d.atomic_write_json(self.d.CACHE_FILE, {"seen": {
+            "acme/gone": {"first_seen": "2026-11-20T00:00:00Z",
+                          "last_pushed": "", "last_checked": ""},
+            "acme/r0": {"first_seen": "2026-11-20T00:00:00Z",
+                        "last_pushed": "2026-11-01T00:00:00Z", "last_checked": ""},
+        }})
+        calls = []
+
+        def fetch(ident, timeout=10):
+            calls.append(ident)
+            if ident == "acme/gone":
+                return None
+            return {"pushed_at": "2026-11-22T00:00:00Z"}
+
+        with mock.patch.dict(os.environ, {self.d.RECHECK_BUDGET_ENV: "2"}), \
+             mock.patch.object(self.d, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.d, "enrich_trending_repos", side_effect=lambda r: list(r)), \
+             mock.patch.object(self.d, "github_search", return_value=([], 0)), \
+             mock.patch.object(self.d, "_repo_metadata", side_effect=fetch):
+            _, extra = self.d.collect_weekly([{"q": "q", "sort": "stars", "order": "desc"}])
+
+        rc = extra["recheck"]
+        self.assertTrue(rc["enabled"])
+        self.assertEqual(rc["attempted"], 2)
+        self.assertEqual(calls, ["acme/gone", "acme/r0"])
+        self.assertEqual(rc["checked"], 1)
+        self.assertEqual(rc["unavailable"], 1)
+
+        seen = json.loads(pathlib.Path(self.d.CACHE_FILE).read_text())["seen"]
+        self.assertEqual(seen["acme/r0"]["last_pushed"], "2026-11-22T00:00:00Z")
+        self.assertTrue(seen["acme/r0"]["last_checked"])
+        self.assertEqual(seen["acme/r0"]["first_seen"], "2026-11-20T00:00:00Z")
+        self.assertEqual(seen["acme/gone"]["last_checked"], "",
+                         "an unavailable check was stamped as checked")
+
+    def test_weekly_recheck_is_off_without_a_budget(self):
+        self.d.atomic_write_json(self.d.CACHE_FILE, {"seen": {
+            "acme/quiet": {"first_seen": "2026-11-20T00:00:00Z",
+                           "last_pushed": "", "last_checked": ""},
+        }})
+        calls = []
+        env = {k: v for k, v in os.environ.items() if k != self.d.RECHECK_BUDGET_ENV}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(self.d, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.d, "enrich_trending_repos", side_effect=lambda r: list(r)), \
+             mock.patch.object(self.d, "github_search", return_value=([], 0)), \
+             mock.patch.object(self.d, "_repo_metadata",
+                               side_effect=lambda i, timeout=10: calls.append(i) or None):
+            _, extra = self.d.collect_weekly([{"q": "q", "sort": "stars", "order": "desc"}])
+        self.assertFalse(extra["recheck"]["enabled"])
+        self.assertIn("no per-run recheck budget", extra["recheck"]["reason"])
+        self.assertEqual(calls, [])
+
+
 class R7Outcomes(unittest.TestCase):
     """R7: minimal outcome contract with honest labels."""
 
