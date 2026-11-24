@@ -86,21 +86,56 @@ class R2CompleteGeneration(unittest.TestCase):
         self.assertEqual(st["calls"], 2)
 
     def test_partial_run_does_not_replace_published_discoveries(self):
-        """A failed scan must not overwrite the last good shared output."""
+        """A failed scan must not overwrite the last good shared output.
+
+        Driven through the real main() rather than re-implementing its
+        publish decision, so the guard is actually exercised.
+        """
         out = pathlib.Path(self.d.OUTPUT_FILE)
         out.write_text('{"previous": "good run"}', encoding="utf-8")
 
-        self.d.reset_acquisition()
-        self.d.record_acquisition(self.d.ACQ_TIMEOUT, "boom")
-        partial = self.d.acquisition_status()["partial"]
-        self.assertTrue(partial)
-        # Mirror main's publish decision without running collection.
-        if partial:
-            self.d.atomic_write_json(
-                os.path.join(self.d.DATA_DIR, "discoveries-daily-partial.json"),
-                {"repos": [], "partial": True},
-            )
-        self.assertEqual(out.read_text(encoding="utf-8"), '{"previous": "good run"}')
+        with mock.patch.object(self.d, "gh_auth_token", return_value=""), \
+             mock.patch.object(self.d, "wait_for_rate_limit"), \
+             mock.patch.object(self.d, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.d, "enrich_trending_repos", side_effect=lambda r: list(r)), \
+             mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()), \
+             mock.patch("sys.stderr", new_callable=lambda: __import__("io").StringIO()) as err:
+            self.d.main()
+            stderr = err.getvalue()
+
+        self.assertEqual(out.read_text(encoding="utf-8"), '{"previous": "good run"}',
+                         "a failed run overwrote the last good output")
+
+        manifest = json.loads(
+            (pathlib.Path(self.d.DATA_DIR) / "discoveries-manifest.json").read_text()
+        )
+        self.assertEqual(manifest["status"], "partial")
+        self.assertFalse(manifest["tuning_eligible"])
+        self.assertTrue(
+            (pathlib.Path(self.d.DATA_DIR) / "discoveries-daily-partial.json").exists(),
+            "the partial artefact was not written for diagnosis",
+        )
+        self.assertIn("kept as last-good", stderr)
+
+    def test_complete_run_publishes(self):
+        """A clean run still publishes as before."""
+        out = pathlib.Path(self.d.OUTPUT_FILE)
+        out.write_text('{"previous": "good run"}', encoding="utf-8")
+        with mock.patch.object(self.d, "gh_auth_token", return_value="tok"), \
+             mock.patch.object(self.d, "wait_for_rate_limit"), \
+             mock.patch.object(self.d, "scrape_all_trending", return_value=[]), \
+             mock.patch.object(self.d, "enrich_trending_repos", side_effect=lambda r: list(r)), \
+             mock.patch.object(self.d, "github_search", return_value=([], 0)), \
+             mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()), \
+             mock.patch("sys.stderr", new_callable=lambda: __import__("io").StringIO()):
+            self.d.main()
+        published = json.loads(out.read_text(encoding="utf-8"))
+        self.assertIn("repos", published)
+        manifest = json.loads(
+            (pathlib.Path(self.d.DATA_DIR) / "discoveries-manifest.json").read_text()
+        )
+        self.assertEqual(manifest["status"], "complete")
+        self.assertTrue(manifest["tuning_eligible"])
 
 
 class R3Transactions(unittest.TestCase):

@@ -1654,9 +1654,31 @@ def main():
         "repos": scored,
     }
 
-    # Write full output to disk
+    # Publish atomically, and only when the run is complete. Both modes share
+    # discoveries.json, so a failed scan used to overwrite the last good
+    # snapshot with an ordinary-looking empty result. A partial run is written
+    # beside it for diagnosis and the published file is left alone.
     os.makedirs(DATA_DIR, exist_ok=True)
-    atomic_write_json(OUTPUT_FILE, output)
+    manifest = {
+        "schema": 3,
+        "mode": MODE,
+        "date": DATE_STR,
+        "run_id": f"{DATE_STR}-{MODE}-{TIME_STR}",
+        "collected_at": output["collected_at"],
+        "status": "partial" if acquisition["partial"] else "complete",
+        "acquisition_outcome": acquisition["worst"],
+        "acquisition_counts": acquisition["counts"],
+        "partial": acquisition["partial"],
+        "tuning_eligible": acquisition["worst"] == ACQ_OK,
+        "repos_found": len(scored),
+        "repos_listed": len([r for r in scored if r.get("classification") != "NOISE"]),
+    }
+    if acquisition["partial"]:
+        atomic_write_json(os.path.join(DATA_DIR, f"discoveries-{MODE}-partial.json"), output)
+        print(f"PUBLISH: partial run — {OUTPUT_FILE} kept as last-good", file=sys.stderr)
+    else:
+        atomic_write_json(OUTPUT_FILE, output)
+    atomic_write_json(os.path.join(DATA_DIR, "discoveries-manifest.json"), manifest)
 
     # Print clean human-readable summary to stdout
     print(build_text_summary(scored, stats, extra_stats))
